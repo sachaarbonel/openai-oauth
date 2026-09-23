@@ -619,14 +619,20 @@ const applyModelDefaults = (
 	const input = Array.isArray(normalized.input) ? [...normalized.input] : []
 	const prefix: unknown[] = []
 	const tools = Array.isArray(normalized.tools) ? normalized.tools : []
+	const functionTools = tools.filter(
+		(tool) => isRecord(tool) && tool.type === "function",
+	)
+	const hostedTools = tools.filter(
+		(tool) => !isRecord(tool) || tool.type !== "function",
+	)
 	if (
-		tools.length > 0 &&
+		functionTools.length > 0 &&
 		!input.some((item) => isRecord(item) && item.type === "additional_tools")
 	) {
 		prefix.push({
 			type: "additional_tools",
 			role: "developer",
-			tools,
+			tools: functionTools,
 		})
 	}
 
@@ -640,7 +646,11 @@ const applyModelDefaults = (
 	normalized.input = [...prefix, ...input]
 	normalized.instructions = ""
 	normalized.parallel_tool_calls = false
-	delete normalized.tools
+	if (hostedTools.length > 0) {
+		normalized.tools = hostedTools
+	} else {
+		delete normalized.tools
+	}
 }
 
 const normalizeCodexResponsesBodyInternal = (

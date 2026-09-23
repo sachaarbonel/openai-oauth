@@ -41,6 +41,11 @@ const createMockFetch = (
 							default_verbosity: "low",
 							default_reasoning_level: "low",
 						},
+						{
+							slug: "gpt-6-astra",
+							visibility: "list",
+							use_responses_lite: true,
+						},
 					],
 				}),
 			)
@@ -143,6 +148,7 @@ describe("createCodexOAuthFetch", () => {
 			"gpt-5.2",
 			"gpt-5.4-mini",
 			"gpt-5.6-sol",
+			"gpt-6-astra",
 			"gpt-image-2",
 		])
 		expect(upstreamCalls(fetch)).toHaveLength(0)
@@ -267,6 +273,65 @@ describe("createCodexOAuthFetch", () => {
 				content: [{ type: "input_text", text: "Hello" }],
 			},
 		])
+	})
+
+	test("keeps hosted web search in top-level tools for Responses Lite", async () => {
+		const fetch = createMockFetch(async (_input, init) => {
+			const body = JSON.parse(String(init?.body))
+			if (body.tool_choice === "required" && !body.tools?.length) {
+				return new Response(
+					"Tool choice 'required' must be specified with 'tools' parameter.",
+					{ status: 400 },
+				)
+			}
+			return new Response(null, { status: 200 })
+		})
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+
+		const response = await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-6-astra",
+				input: "Search the web.",
+				tools: [{ type: "web_search" }],
+				tool_choice: "required",
+				stream: true,
+			}),
+		})
+
+		expect(response.status).toBe(200)
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		const body = JSON.parse(String(init?.body))
+		expect(body.tools).toEqual([{ type: "web_search" }])
+		expect(body.tool_choice).toBe("required")
+		expect(body.input).not.toContainEqual(
+			expect.objectContaining({ type: "additional_tools" }),
+		)
+	})
+
+	test("splits hosted and function tools for Responses Lite", async () => {
+		const fetch = createMockFetch()
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+
+		await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-5.6-sol",
+				tools: [{ type: "function", name: "weather" }, { type: "web_search" }],
+				stream: true,
+			}),
+		})
+
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		const body = JSON.parse(String(init?.body))
+		expect(body.tools).toEqual([{ type: "web_search" }])
+		expect(body.input).toContainEqual({
+			type: "additional_tools",
+			role: "developer",
+			tools: [{ type: "function", name: "weather" }],
+		})
 	})
 
 	test("routes FedRAMP sessions without accepting caller header overrides", async () => {
