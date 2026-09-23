@@ -20,10 +20,66 @@ and [function-calling guide](https://developers.openai.com/api/docs/guides/funct
 The compatibility regression itself is established by the capture and the offline
 SDK reproduction, not by an assumption about the OAuth upstream's implementation.
 
-Verification on 2026-09-23: 182 repository tests passed (three live tests skipped),
-plus both isolated Agents SDK fixtures. Lint, typecheck, full build, browser-bundle
+### Follow-up: valid null options rejected by a consumer
+
+After this repair was deployed, the separately approved live test at
+2026-09-23 16:42 UTC received both completed items in terminal output, and the SDK
+normalized two items. It still stopped before command execution after one HTTP
+200 response (1,293 reported tokens). The consumer's harness did not retain its
+stopping exception, so that live failure's exact cause remains unconfirmed.
+
+Offline investigation reproduced a concrete **consumer-side** failure in
+Norilu's `SdkTurnEvents`: its `exec_command` event parser accepts omitted
+`workdir` but throws a Zod validation error for `workdir: null`. The SDK's strict
+tool schema permits that representation. OpenAI's
+[strict-mode documentation](https://developers.openai.com/api/docs/guides/function-calling#strict-mode)
+describes nullable types for optional function fields.
+
+The native Agents SDK handles these null options correctly before executing its
+tool, but `run_item_stream_event.item.rawItem.arguments` still contains the wire
+arguments. A consumer inspecting those raw events must accept their wire schema:
+
+```ts
+const args = z.object({
+  cmd: z.string(),
+  workdir: z.string().nullish(),
+}).parse(JSON.parse(raw.arguments));
+// Retain the existing working-directory fallback for omitted or null values.
+const cwd = args.workdir ?? defaultWorkingDirectory;
+```
+
+This repair is now applied and tested locally in **Norilu**, not in the proxy.
+Removing nulls globally in the proxy could destroy intentionally nullable domain
+values or violate a tool's required-field schema. The transport must preserve
+tool names, argument strings and call IDs; execution normalization belongs to
+the schema-aware SDK or consumer adapter.
+
+The new offline tests verify raw null preservation for streaming/non-streaming
+responses and a complete native `SandboxAgent` tool round trip with nullable
+options. The SDK receives nulls in the raw event, invokes the stub exactly once
+with the optional values normalized, then sends the matching result and returns
+a final answer. Before the consumer fix, the local Norilu reproduction recorded
+`sdkPhase: events`, `failureKind: validation`, one approved command proposal and
+zero executions. After the fix, the network-disabled Docker/Python fixture
+completed with one proposal, one execution, two synthetic Responses calls and
+no SDK failures. That establishes a real parser defect and an offline repair,
+**not proof that the unretained live arguments contained nulls**. No new inference
+request was made for this follow-up.
+
+This follow-up adds regressions and investigation notes, not another proxy runtime
+rewrite. Pull it to run the offline checks; a proxy restart alone cannot fix the
+consumer's parser. Norilu's harness now retains its existing safe failure
+classification and command-proposal count, without logging message text,
+credentials or raw arguments. Neither application was deployed by this follow-up.
+
+Initial repair verification on 2026-09-23: 182 repository tests passed (three live
+tests skipped), plus both isolated Agents SDK fixtures. Lint, typecheck, full build, browser-bundle
 checks, and release-artifact checks passed. No live model request or deployment
 was performed for this patch.
+
+Nullable-options follow-up verification: 184 repository tests passed (three live
+tests skipped), plus all three isolated Agents SDK fixtures. Lint, typecheck and
+the full build passed. This follow-up changes tests and documentation only.
 
 ## Repair policy
 
@@ -80,15 +136,16 @@ node scripts/test-agents-sdk-responses.mjs "$sdk_fixture_dir"
 
 Alternatively pass an existing project directory containing those versions.
 The script uses the built HTTP fetch handler and the actual SDK decoder/runner
-for both a regular `Agent` and a `SandboxAgent` with native `exec_command`.
+for a regular `Agent` and a `SandboxAgent` with native `exec_command`, including
+nullable optional fields in the wire arguments.
 Upstream responses, credentials, and sandbox execution are inert fixtures.
 Global external fetch is forbidden and tracing is disabled. Each test permits at
 most two mocked Responses requests and uses a five-second run abort deadline.
 No actual shell command, model generation, account, or external connection is used.
 
-Both fixtures failed against the preceding build: no tool executed before the
-second request. With the repaired build, each invokes its stub once, sends the
-matching call result in stateless history, and reaches the final answer. This is
+The original two fixtures failed against the preceding build: no tool executed
+before the second request. With the repaired build, all three invoke a stub once,
+send the matching call result in stateless history, and reach the final answer. This is
 an offline protocol check, not a claim that the live workflow has been completed.
 
 ## Mac deployment handoff

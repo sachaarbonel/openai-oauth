@@ -54,7 +54,7 @@ const message = (text, phase) => ({
 	content: [{ type: "output_text", text, annotations: [] }],
 })
 
-const responseStream = (ordinal, native) => {
+const responseStream = (ordinal, native, nullableOptions) => {
 	const call = {
 		type: "function_call",
 		id: "fc_fixture",
@@ -62,7 +62,21 @@ const responseStream = (ordinal, native) => {
 		status: "completed",
 		name: native ? "exec_command" : "read_fixture",
 		arguments: JSON.stringify(
-			native ? { cmd: command, login: false } : { label },
+			native
+				? {
+						cmd: command,
+						login: false,
+						...(nullableOptions
+							? {
+									workdir: null,
+									shell: null,
+									tty: false,
+									yield_time_ms: 1000,
+									max_output_tokens: null,
+								}
+							: {}),
+					}
+				: { label },
 		),
 	}
 	const items =
@@ -145,9 +159,13 @@ const responseStream = (ordinal, native) => {
 	)
 }
 
-for (const native of [false, true]) {
+for (const { native, nullableOptions } of [
+	{ native: false, nullableOptions: false },
+	{ native: true, nullableOptions: false },
+	{ native: true, nullableOptions: true },
+]) {
 	test(
-		`${native ? "SandboxAgent exec_command" : "Agent function tool"}: completed items survive the HTTP handler and execute once`,
+		`${native ? "SandboxAgent exec_command" : "Agent function tool"}${nullableOptions ? " with nullable options" : ""}: completed items survive the HTTP handler and execute once`,
 		{ timeout: 10000 },
 		async () => {
 			const root = await mkdtemp(join(tmpdir(), "openai-oauth-sdk-fixture-"))
@@ -195,13 +213,21 @@ for (const native of [false, true]) {
 								(item) => item.type === "function_call",
 							)
 							assert.equal(call?.call_id, "call_fixture")
+							if (nullableOptions) {
+								// Wire nulls remain intact. Only the SDK tool's schema-aware
+								// parser may translate optional nulls to omitted values.
+								const args = JSON.parse(call.arguments)
+								assert.equal(args.workdir, null)
+								assert.equal(args.shell, null)
+								assert.equal(args.max_output_tokens, null)
+							}
 							const result = body.input.find(
 								(item) => item.type === "function_call_output",
 							)
 							assert.equal(result?.call_id, "call_fixture")
 							assert.match(JSON.stringify(result.output), /fixture:café/)
 						}
-						return responseStream(requests, native)
+						return responseStream(requests, native, nullableOptions)
 					},
 				})
 				const client = new OpenAI({
@@ -246,6 +272,11 @@ for (const native of [false, true]) {
 					supportsPty: () => false,
 					execCommand: async (args) => {
 						assert.equal(args.cmd, command)
+						if (nullableOptions) {
+							assert.equal(args.workdir, undefined)
+							assert.equal(args.shell, undefined)
+							assert.equal(args.maxOutputTokens, undefined)
+						}
 						assert.equal(++calls, 1)
 						return `fixture:${label}`
 					},
@@ -272,7 +303,18 @@ for (const native of [false, true]) {
 					...(native ? { sandbox: { session } } : {}),
 				})
 				const textDeltas = []
+				let nullableCallEvents = 0
 				for await (const event of result) {
+					if (
+						nullableOptions &&
+						event.type === "run_item_stream_event" &&
+						event.name === "tool_called"
+					) {
+						const args = JSON.parse(event.item.rawItem.arguments)
+						assert.equal(args.workdir, null)
+						assert.equal(args.shell, null)
+						nullableCallEvents++
+					}
 					if (
 						event.type === "raw_model_stream_event" &&
 						event.data.type === "output_text_delta"
@@ -283,6 +325,7 @@ for (const native of [false, true]) {
 				assert.equal(calls, 1)
 				assert.equal(requests, 2)
 				assert.equal(result.finalOutput, `fixture:${label}`)
+				assert.equal(nullableCallEvents, nullableOptions ? 1 : 0)
 				assert.ok(
 					textDeltas.includes("Reading fixture."),
 					"Text remains streamed",

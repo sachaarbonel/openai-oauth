@@ -95,6 +95,30 @@ describe("Responses terminal output compatibility", () => {
 	})
 
 	test.each([
+		true,
+		false,
+	])("preserves nullable tool arguments verbatim with stream=%s", async (stream) => {
+		// Null may mean an omitted strict-mode option or an intentional domain value.
+		// The transport has no authority to delete it from either kind of argument.
+		const nullable = {
+			...call,
+			arguments:
+				'{ "label": "fixture", "option": null, "nested": { "value": null } }',
+		}
+		for (const output of [[], [nullable]]) {
+			const response = await request(
+				encodeEvents([done(nullable, 0), terminal(output)]),
+				stream,
+			)
+			const result = stream
+				? (await eventsFrom(response)).at(-1).response
+				: await response.json()
+			expect(result.output).toEqual([nullable])
+			expect(result.output[0].arguments).toBe(nullable.arguments)
+		}
+	})
+
+	test.each([
 		"failed",
 		"incomplete",
 		"cancelled",
