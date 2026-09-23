@@ -1,3 +1,7 @@
+import {
+	CompletedResponseOutput,
+	terminalResponseEvents,
+} from "./responses-output.js"
 import { isRecord } from "./utils.js"
 
 const SSE_SEPARATOR = /\r?\n\r?\n/
@@ -67,123 +71,91 @@ export async function* iterateServerSentEvents(
 	}
 }
 
-const terminalServerSentEvents = new Set([
-	"error",
-	"response.completed",
-	"response.failed",
-	"response.cancelled",
-	"response.canceled",
-	"response.incomplete",
-])
-
-const terminalResponseStatuses = new Set([
-	"completed",
-	"failed",
-	"cancelled",
-	"canceled",
-	"incomplete",
-])
-
-const isTerminalPayload = (data: string): boolean => {
-	if (data === "[DONE]") {
-		return true
-	}
-
+const parsePayload = (
+	event: ServerSentEvent,
+): Record<string, unknown> | undefined => {
 	try {
-		const parsed = JSON.parse(data)
-		if (!isRecord(parsed)) {
-			return false
-		}
-
-		const type = parsed.type
-		if (typeof type === "string" && terminalServerSentEvents.has(type)) {
-			return true
-		}
-
-		const response = parsed.response
-		if (!isRecord(response)) {
-			return false
-		}
-
-		const responseType = response.type
-		const status = response.status
-		return (
-			(typeof responseType === "string" &&
-				terminalServerSentEvents.has(responseType)) ||
-			(typeof status === "string" && terminalResponseStatuses.has(status))
-		)
+		const parsed: unknown = JSON.parse(event.data ?? "")
+		return isRecord(parsed) ? parsed : undefined
 	} catch {
-		return false
+		return undefined
 	}
+}
+
+/** Preserve event bytes except the repaired terminal data; no tee or read-ahead loop. */
+export const normalizeResponsesSse = (
+	stream: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> => {
+	const output = new CompletedResponseOutput()
+	const decoder = new TextDecoder("utf-8", { fatal: true })
+	const encoder = new TextEncoder()
+	const maxEventCharacters = 32 * 1024 * 1024
+	let buffer = ""
+
+	const normalizeBlock = (block: string): string => {
+		if (block.length > maxEventCharacters)
+			throw new Error("Responses SSE event size limit exceeded.")
+		const event = parseEventBlock(block)
+		const parsed = parsePayload(event)
+		if (!parsed) return block
+		const type = typeof parsed.type === "string" ? parsed.type : event.event
+		const normalized = output.accept(type, parsed)
+		if (normalized === parsed) return block
+		let replaced = false
+		return block
+			.split(/\r?\n/)
+			.flatMap((line) => {
+				if (!line.startsWith("data:")) return [line]
+				if (replaced) return []
+				replaced = true
+				return [`data: ${JSON.stringify(normalized)}`]
+			})
+			.join(block.includes("\r\n") ? "\r\n" : "\n")
+	}
+
+	return stream.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				buffer += decoder.decode(chunk, { stream: true })
+				let match = SSE_SEPARATOR.exec(buffer)
+				while (match !== null) {
+					controller.enqueue(
+						encoder.encode(
+							normalizeBlock(buffer.slice(0, match.index)) + match[0],
+						),
+					)
+					buffer = buffer.slice(match.index + match[0].length)
+					match = SSE_SEPARATOR.exec(buffer)
+				}
+				if (buffer.length > maxEventCharacters)
+					throw new Error("Responses SSE event size limit exceeded.")
+			},
+			flush(controller) {
+				buffer += decoder.decode()
+				// An unterminated frame is not evidence of a completed response.
+				if (!output.terminal)
+					throw new Error("Responses stream ended before a terminal response.")
+				if (buffer) controller.enqueue(encoder.encode(buffer))
+			},
+		}),
+	)
 }
 
 export const collectCompletedResponseFromSse = async (
 	stream: ReadableStream<Uint8Array>,
 ): Promise<Record<string, unknown>> => {
-	let latestResponse: Record<string, unknown> | undefined
-	let latestError: unknown
-	const outputItems = new Map<string, Record<string, unknown>>()
-
-	const withCollectedOutput = (
-		response: Record<string, unknown>,
-	): Record<string, unknown> => {
-		const output = Array.isArray(response.output) ? response.output : []
-		if (output.length > 0 || outputItems.size === 0) {
-			return response
-		}
-
-		return {
-			...response,
-			output: [...outputItems.values()],
-		}
-	}
+	const output = new CompletedResponseOutput()
 
 	for await (const event of iterateServerSentEvents(stream)) {
-		if (typeof event.data !== "string" || event.data.length === 0) {
-			continue
-		}
-
-		const terminal = Boolean(
-			(event.event && terminalServerSentEvents.has(event.event)) ||
-				isTerminalPayload(event.data),
-		)
-
-		try {
-			const parsed = JSON.parse(event.data)
-			if (!isRecord(parsed)) {
-				continue
-			}
-
-			if (event.event === "error") {
-				latestError = parsed
-				continue
-			}
-
-			const item = parsed.item
-			if (isRecord(item) && typeof item.id === "string") {
-				outputItems.set(item.id, item)
-			}
-
-			const response = parsed.response
-			if (isRecord(response)) {
-				latestResponse = response
-			}
-
-			if (terminal && latestResponse) {
-				return withCollectedOutput(latestResponse)
-			}
-		} catch {}
-
-		if (terminal && latestResponse) {
-			return withCollectedOutput(latestResponse)
-		}
+		const parsed = parsePayload(event)
+		if (!parsed) continue
+		const type = typeof parsed.type === "string" ? parsed.type : event.event
+		if (type === "error")
+			throw new Error("Responses stream returned an error event.")
+		const normalized = output.accept(type, parsed)
+		if (terminalResponseEvents.has(type ?? "") && isRecord(normalized.response))
+			return normalized.response
 	}
 
-	if (latestResponse) {
-		return withCollectedOutput(latestResponse)
-	}
-
-	throw new Error(
-		`No completed response found in SSE stream.${latestError ? ` Last error: ${JSON.stringify(latestError)}` : ""}`,
-	)
+	throw new Error("No terminal response found in SSE stream.")
 }

@@ -4,7 +4,10 @@ import {
 	fetchCodexModelCatalog,
 	isPublicCodexModel,
 } from "./models.js"
-import { collectCompletedResponseFromSse } from "./sse.js"
+import {
+	collectCompletedResponseFromSse,
+	normalizeResponsesSse,
+} from "./sse.js"
 import { CodexResponsesState } from "./state.js"
 import { isRecord } from "./utils.js"
 
@@ -792,7 +795,15 @@ const finalizeResponsesResponse = async (
 	}
 
 	if (prepared.wantsStream) {
-		return captureResponsesState(response, prepared.requestBody, state)
+		const headers = new Headers(response.headers)
+		headers.delete("content-encoding")
+		headers.delete("content-length")
+		const normalized = new Response(normalizeResponsesSse(response.body), {
+			status: response.status,
+			statusText: response.statusText,
+			headers,
+		})
+		return captureResponsesState(normalized, prepared.requestBody, state)
 	}
 
 	const completed = await collectCompletedResponseFromSse(response.body)

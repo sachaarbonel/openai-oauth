@@ -609,7 +609,7 @@ describe("collectCompletedResponseFromSse", () => {
 					new TextEncoder().encode(
 						[
 							"event: response.output_item.done",
-							'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"weather","arguments":"{}"}}',
+							'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"weather","arguments":"{}"}}',
 							"",
 							"event: response.completed",
 							'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}',
