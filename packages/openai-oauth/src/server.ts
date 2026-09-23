@@ -17,6 +17,7 @@ import {
 import { createRequestLogger } from "./logging.js"
 import { createModelResolver } from "./models.js"
 import { handleResponsesRequest } from "./responses.js"
+import { createResponsesDiagnostics } from "./responses-diagnostics.js"
 import {
 	DEFAULT_HOST,
 	DEFAULT_PORT,
@@ -37,6 +38,7 @@ const handleRoutes = async (
 	client: OpenAIOAuthTransport,
 	resolveModels: () => Promise<string[]>,
 	requestLogger: ReturnType<typeof createRequestLogger>,
+	responsesDiagnostics: ReturnType<typeof createResponsesDiagnostics>,
 ): Promise<Response> => {
 	const url = new URL(request.url)
 	if (request.method === "GET" && url.pathname === "/health") {
@@ -68,7 +70,7 @@ const handleRoutes = async (
 	}
 
 	if (request.method === "POST" && url.pathname === "/v1/responses") {
-		return handleResponsesRequest(request, client)
+		return handleResponsesRequest(request, client, responsesDiagnostics())
 	}
 
 	if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
@@ -97,6 +99,7 @@ const createOpenAIOAuthRuntime = (settings: OpenAIOAuthServerOptions = {}) => {
 	const provider = createOpenAIOAuth(client)
 	const resolveModels = createModelResolver(client, settings.models)
 	const requestLogger = createRequestLogger(settings)
+	const responsesDiagnostics = createResponsesDiagnostics()
 
 	const handler = async (request: Request): Promise<Response> => {
 		try {
@@ -106,6 +109,7 @@ const createOpenAIOAuthRuntime = (settings: OpenAIOAuthServerOptions = {}) => {
 				client,
 				resolveModels,
 				requestLogger,
+				responsesDiagnostics,
 			)
 		} catch (error) {
 			return toErrorResponse(
