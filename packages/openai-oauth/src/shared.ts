@@ -166,7 +166,7 @@ const toHeaders = (headers: IncomingHttpHeaders): Headers => {
 
 export const toWebRequest = async (
 	request: IncomingMessage,
-	options: { host: string; port: number },
+	options: { host: string; port: number; signal: AbortSignal },
 ): Promise<Request> => {
 	const url = `http://${options.host}:${options.port}${request.url ?? "/"}`
 	const body =
@@ -177,6 +177,7 @@ export const toWebRequest = async (
 	return new Request(url, {
 		method: request.method,
 		headers: toHeaders(request.headers),
+		signal: options.signal,
 		body:
 			body == null || body.byteLength === 0
 				? undefined
@@ -188,7 +189,13 @@ export const toWebRequest = async (
 export const writeWebResponse = async (
 	response: ServerResponse,
 	webResponse: Response,
+	signal: AbortSignal,
 ): Promise<void> => {
+	if (signal.aborted || response.destroyed) {
+		void webResponse.body?.cancel(signal.reason).catch(() => {})
+		return
+	}
+
 	response.statusCode = webResponse.status
 	webResponse.headers.forEach((value, key) => {
 		response.setHeader(key, value)
@@ -200,20 +207,31 @@ export const writeWebResponse = async (
 	}
 
 	const reader = webResponse.body.getReader()
+	const cancel = () => {
+		// Cancellation must release a pending read, even if no more bytes arrive.
+		void reader.cancel(signal.reason).catch(() => {})
+	}
+	signal.addEventListener("abort", cancel, { once: true })
+	let completed = false
 	try {
-		while (true) {
+		while (!signal.aborted && !response.destroyed) {
 			const { done, value } = await reader.read()
 			if (done) {
+				completed = true
 				break
 			}
 
-			response.write(Buffer.from(value))
+			if (!signal.aborted && !response.destroyed) {
+				response.write(Buffer.from(value))
+			}
 		}
 	} finally {
+		signal.removeEventListener("abort", cancel)
+		if (!completed) cancel()
 		reader.releaseLock()
 	}
 
-	response.end()
+	if (!signal.aborted && !response.destroyed) response.end()
 }
 
 export const resolveAddress = (

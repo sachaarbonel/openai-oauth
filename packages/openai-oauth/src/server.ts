@@ -137,11 +137,26 @@ export const startOpenAIOAuthServer = async (
 	const models = await runtime.resolveModels()
 	const handler = runtime.handler
 	const server = createServer(async (req, res) => {
+		const controller = new AbortController()
+		const abort = () => controller.abort()
+		req.once("aborted", abort)
+		res.once("close", () => {
+			req.off("aborted", abort)
+			// IncomingMessage.close also fires after a normal POST body is read.
+			// Only an unfinished outgoing response indicates a disconnected client.
+			if (!res.writableFinished) abort()
+		})
 		try {
-			const request = await toWebRequest(req, { host, port })
+			const request = await toWebRequest(req, {
+				host,
+				port,
+				signal: controller.signal,
+			})
+			controller.signal.throwIfAborted()
 			const response = await handler(request)
-			await writeWebResponse(res, response)
+			await writeWebResponse(res, response, controller.signal)
 		} catch (error) {
+			if (controller.signal.aborted || res.destroyed) return
 			if (res.headersSent || res.writableEnded) {
 				res.destroy(error instanceof Error ? error : undefined)
 				return
@@ -149,7 +164,11 @@ export const startOpenAIOAuthServer = async (
 
 			const message =
 				error instanceof Error ? error.message : "Unexpected server error."
-			await writeWebResponse(res, toErrorResponse(message, 500, "server_error"))
+			await writeWebResponse(
+				res,
+				toErrorResponse(message, 500, "server_error"),
+				controller.signal,
+			)
 		}
 	})
 
