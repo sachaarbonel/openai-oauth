@@ -52,9 +52,9 @@ export const handleResponsesRequest = async (
 			signal: request.signal,
 		})
 	} catch (error) {
-		await record("transport_or_auth", new Response(null, { status: 500 }))
+		await record("transport_or_auth", new Response(null, { status: 500 }), body)
 		throw error
 	}
-	await record("upstream_response", upstream)
+	await record("upstream_response", upstream, body)
 	return copyUpstreamResponse(upstream)
 }

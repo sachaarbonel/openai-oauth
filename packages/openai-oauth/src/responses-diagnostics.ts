@@ -5,6 +5,7 @@ type Stage = "proxy_validation" | "upstream_response" | "transport_or_auth"
 export type ResponseDiagnostic = (
 	stage: Stage,
 	response: Response,
+	requestBody?: Record<string, unknown>,
 ) => Promise<Response>
 
 const safeWords = new Set([
@@ -89,8 +90,61 @@ const safeField = (value: unknown) => {
 	return tokens.every((token) => safeWords.has(token)) ? value : undefined
 }
 
+const serviceTiers = new Set([
+	"auto",
+	"default",
+	"flex",
+	"priority",
+	"scale",
+	"fast",
+])
+
+// Preserve word order and negation without copying arbitrary upstream prose.
+// Every emitted word comes from this finite vocabulary; all other spans collapse
+// to [redacted]. This is an outline, not the complete upstream explanation.
+const messageWords = new Set([
+	...[...safeWords].map((word) => word.toLowerCase()),
+	...serviceTiers,
+	..."invalid unsupported supported allowed disallowed forbidden permitted denied unavailable available required requires expected valid value values argument parameter field tier tiers account project plan must should can cannot is are was were be not only one of and or for with this the a an to on in set provided received does do support supports accept accepts accepted rejected enabled disabled".split(
+		" ",
+	),
+])
+
+const summarizeMessage = (message: string) => {
+	const words: string[] = []
+	// Drop credential-bearing header/assignment tails even when a credential
+	// happens to be a word in the public protocol vocabulary.
+	const text = message
+		.replace(
+			/\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=][^\r\n]*/gi,
+			"[redacted]",
+		)
+		.replace(/\bcan't\b/gi, "cannot")
+		.replace(/\b(is|are|was|were|does|do|must|should)n't\b/gi, "$1 not")
+	for (const token of text.split(/[\s"'`:,;()[\]{}!?]+/)) {
+		if (!token) continue
+		const word = token.toLowerCase().replace(/\.$/, "")
+		if (messageWords.has(word)) words.push(word)
+		else if (words.at(-1) !== "[redacted]") words.push("[redacted]")
+		if (words.length === 64) {
+			words.push("[truncated]")
+			break
+		}
+	}
+	return words.join(" ").slice(0, 768) || undefined
+}
+
+const summarizeServiceTier = (body: Record<string, unknown>) => {
+	const value = body.service_tier
+	if (value === undefined) return "omitted"
+	if (value === null) return "null"
+	return typeof value === "string" && serviceTiers.has(value)
+		? value
+		: "unrecognized_value_withheld"
+}
+
 // Error fields can echo secrets and prompts. Only known protocol identifiers and
-// fixed explanations leave this function; unrecognized prose is never logged.
+// fixed vocabulary leave this function; unrecognized prose is never logged.
 export const summarizeRejection = (body: unknown) => {
 	const root = isRecord(body) ? body : {}
 	const errors = Array.isArray(root.detail)
@@ -163,6 +217,7 @@ export const summarizeRejection = (body: unknown) => {
 		code: safeField(error.code),
 		param: safeField(error.param) ?? safeField(location),
 		reason,
+		messageSummary: summarizeMessage(message),
 		withheldBecause:
 			reason === "unrecognized_message_withheld"
 				? message
@@ -264,7 +319,7 @@ export const createResponsesDiagnostics = (
 		if (!enabled || remaining-- <= 0) return undefined
 		const requestId = randomUUID()
 		const started = Date.now()
-		return async (stage, response) => {
+		return async (stage, response, requestBody) => {
 			try {
 				write(
 					JSON.stringify({
@@ -274,6 +329,9 @@ export const createResponsesDiagnostics = (
 						stage,
 						status: response.status,
 						durationMs: Date.now() - started,
+						request: requestBody
+							? { serviceTier: summarizeServiceTier(requestBody) }
+							: undefined,
 						rejection: response.ok ? undefined : await readSummary(response),
 					}),
 				)

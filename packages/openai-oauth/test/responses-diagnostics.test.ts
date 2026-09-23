@@ -86,6 +86,84 @@ describe("bounded Responses diagnostics", () => {
 		})
 	})
 
+	test("keeps a bounded outline of unfamiliar detail strings without credentials", async () => {
+		// Synthetic wording in the observed detail-string format. The real
+		// rejection's prose was not retained and cannot be reconstructed.
+		const detail =
+			"service_tier 'auto' isn't supported. Valid values are 'default', 'flex' and 'priority'. Authorization: Bearer SECRET_TOKEN. Cookie: SECRET_COOKIE"
+		const response = Response.json({ detail }, { status: 400 })
+		const write = vi.fn()
+		await createResponsesDiagnostics(true, write)()?.(
+			"upstream_response",
+			response,
+			{ service_tier: "auto", input: "PRIVATE_PROMPT" },
+		)
+		const log = write.mock.calls[0][0]
+		expect(JSON.parse(log)).toMatchObject({
+			request: { serviceTier: "auto" },
+			rejection: {
+				format: "json",
+				shape: "detail_string",
+				reason: "unrecognized_message_withheld",
+				messageSummary:
+					"service_tier auto is not supported valid values are default flex and priority [redacted]",
+			},
+		})
+		expect(log).not.toMatch(/SECRET|PRIVATE|Authorization|Bearer|Cookie/)
+		expect(log.length).toBeLessThan(2048)
+		expect(await response.json()).toEqual({ detail })
+	})
+
+	test("records only a safe tier value and leaves the forwarded request unchanged", async () => {
+		for (const value of [undefined, null, "auto", "priority", "SECRET_TIER"]) {
+			const body = {
+				model: "fixture",
+				input: "PRIVATE_PROMPT",
+				service_tier: value,
+				stream: true,
+				tools: [{ type: "apply_patch" }],
+			}
+			const request = vi.fn(async () =>
+				Response.json({ detail: "service_tier is invalid" }, { status: 400 }),
+			)
+			const write = vi.fn()
+			await handleResponsesRequest(
+				new Request("http://fixture.invalid/v1/responses", {
+					method: "POST",
+					body: JSON.stringify(body),
+				}),
+				{ request } as unknown as OpenAIOAuthTransport,
+				createResponsesDiagnostics(true, write)(),
+			)
+			expect(request).toHaveBeenCalledExactlyOnceWith(
+				"/responses",
+				expect.objectContaining({ body: JSON.stringify(body) }),
+			)
+			const log = write.mock.calls[0][0]
+			expect(JSON.parse(log).request.serviceTier).toBe(
+				value === undefined
+					? "omitted"
+					: value === null
+						? "null"
+						: value === "SECRET_TIER"
+							? "unrecognized_value_withheld"
+							: value,
+			)
+			expect(log).not.toMatch(/SECRET_TIER|PRIVATE_PROMPT/)
+		}
+	})
+
+	test("bounds summaries and removes credential assignments containing allowed words", () => {
+		const summary = summarizeRejection({
+			detail: "service_tier is invalid. Authorization: Bearer priority",
+		})
+		expect(summary.messageSummary).toBe("service_tier is invalid [redacted]")
+		expect(
+			summarizeRejection({ detail: "service_tier is invalid ".repeat(200) })
+				.messageSummary?.length,
+		).toBeLessThanOrEqual(768)
+	})
+
 	test.each([
 		{
 			label: "JSON detail string",
