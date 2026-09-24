@@ -1,5 +1,5 @@
 // Optional, entirely offline compatibility fixture. Dependencies stay outside this
-// monorepo; see docs/responses-sdk-compatibility.md for the pinned install command.
+// monorepo in the dependency directory passed as the first argument.
 import assert from "node:assert/strict"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { createRequire } from "node:module"

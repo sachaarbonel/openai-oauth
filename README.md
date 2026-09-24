@@ -590,9 +590,6 @@ What is intentionally not there yet:
 - There is no stateful replay support on the CLI `/v1/responses` endpoint. The proxy is stateless and expects callers to send the full conversation history.
 - Hosted browser sign-in currently supports Chrome and Firefox. Safari is not yet supported.
 
-For streaming tool-call compatibility, offline Agents SDK tests, and fork deployment
-steps, see [Responses SDK compatibility](docs/responses-sdk-compatibility.md).
-
 ## How it Works
 
 OpenAI's Codex CLI uses authenticated endpoints at `chatgpt.com/backend-api/codex` to run models with your ChatGPT account.
