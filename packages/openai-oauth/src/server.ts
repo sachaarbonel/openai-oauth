@@ -99,6 +99,9 @@ const createOpenAIOAuthRuntime = (settings: OpenAIOAuthServerOptions = {}) => {
 	const auth = openaiCredentials(settings)
 	const sharedSettings = {
 		...settings,
+		standaloneSearch:
+			settings.standaloneSearch ??
+			process.env.CODEX_OPENAI_STANDALONE_SEARCH === "1",
 		fetch: observeResponsesFetch(settings.fetch ?? globalThis.fetch),
 		auth: () => auth.getSession(),
 		responsesState: false as const,

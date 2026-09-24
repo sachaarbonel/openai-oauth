@@ -119,6 +119,7 @@ export type OpenAIOAuthServerLogEvent =
 	  }
 
 export type OpenAIOAuthServerOptions = LocalOpenAIOAuthOptions & {
+	standaloneSearch?: boolean
 	host?: string
 	port?: number
 	models?: string[]

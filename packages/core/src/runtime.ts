@@ -4,6 +4,7 @@ import {
 	fetchCodexModelCatalog,
 	isPublicCodexModel,
 } from "./models.js"
+import { standaloneSearchResponse } from "./search-bridge.js"
 import {
 	collectCompletedResponseFromSse,
 	normalizeResponsesSse,
@@ -112,6 +113,8 @@ type CodexOAuthRuntimeSettings = {
 	headers?: Record<string, string>
 	instructions?: string
 	responsesState?: CodexResponsesState | false
+	/** Opt-in bounded adapter for Responses Lite standalone web search. */
+	standaloneSearch?: boolean
 }
 
 export type OpenAIOAuthTransportOptions = Omit<
@@ -685,6 +688,7 @@ type PreparedResponsesRequestBody = {
 	body: BodyInit | null | undefined
 	requestBody?: Record<string, unknown>
 	wantsStream?: boolean
+	useResponsesLite?: boolean
 }
 
 type ResolveModelInfo = (
@@ -755,6 +759,7 @@ const prepareResponsesRequestBody = async (
 			body: JSON.stringify(expanded),
 			requestBody: expanded,
 			wantsStream,
+			useResponsesLite: modelInfo?.useResponsesLite === true,
 		}
 	} catch {
 		return { body }
@@ -1021,12 +1026,37 @@ const createCodexOAuthFetch = (
 			resolveModelInfo,
 		)
 
-		const response = await fetch(target.toString(), {
-			method: request.method ?? init?.method,
-			headers,
-			body: preparedBody.body,
-			signal: request.signal ?? undefined,
-		})
+		const bridge =
+			settings.standaloneSearch === true &&
+			preparedBody.useResponsesLite === true &&
+			preparedBody.requestBody !== undefined &&
+			Array.isArray(preparedBody.requestBody.tools) &&
+			preparedBody.requestBody.tools.some(
+				(tool) => isRecord(tool) && tool.type === "web_search",
+			)
+		const response =
+			bridge && preparedBody.requestBody
+				? await standaloneSearchResponse(
+						preparedBody.requestBody,
+						(path, body, signal) => {
+							const callHeaders = new Headers(headers)
+							if (path === "alpha/search")
+								callHeaders.delete(RESPONSES_LITE_HEADER)
+							return fetch(new URL(path, `${baseURL}/`).toString(), {
+								method: "POST",
+								headers: callHeaders,
+								body: JSON.stringify(body),
+								signal,
+							})
+						},
+						request.signal,
+					)
+				: await fetch(target.toString(), {
+						method: request.method ?? init?.method,
+						headers,
+						body: preparedBody.body,
+						signal: request.signal ?? undefined,
+					})
 
 		return finalizeResponsesResponse(response, preparedBody, responsesState)
 	}
