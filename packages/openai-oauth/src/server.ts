@@ -153,6 +153,7 @@ export const startOpenAIOAuthServer = async (
 		let streamObserver: ReturnType<typeof getResponsesStreamObserver>
 		const abort = () => controller.abort()
 		req.once("aborted", abort)
+		res.once("finish", () => streamObserver?.finish("forwarded"))
 		res.once("close", () => {
 			req.off("aborted", abort)
 			// IncomingMessage.close also fires after a normal POST body is read.
@@ -178,9 +179,7 @@ export const startOpenAIOAuthServer = async (
 					/* Diagnostic inspection must not interrupt forwarding. */
 				}
 			})
-			streamObserver?.finish(
-				controller.signal.aborted ? "client_closed" : "forwarded",
-			)
+			if (controller.signal.aborted) streamObserver?.finish("client_closed")
 		} catch (error) {
 			streamObserver?.finish(
 				controller.signal.aborted || res.destroyed
