@@ -263,7 +263,7 @@ describe("opt-in standalone search bridge", () => {
 		expect(f.requests).toHaveLength(1)
 	})
 
-	test("a stalled search is aborted at the bridge deadline", async () => {
+	test("a stalled search is aborted at its search deadline", async () => {
 		vi.useFakeTimers()
 		try {
 			let active: AbortSignal | null | undefined
@@ -276,13 +276,42 @@ describe("opt-in standalone search bridge", () => {
 			const done = collect(await f.request())
 			await vi.waitFor(() => expect(f.requests).toHaveLength(2))
 			await vi.advanceTimersByTimeAsync(60_000)
-			expect((await done).result.error.code).toBe("search_cancelled")
+			expect((await done).result.error.code).toBe("search_timeout")
 			expect(active?.aborted).toBe(true)
 			expect(f.requests).toHaveLength(2)
 		} finally {
 			vi.useRealTimers()
 		}
 	})
+
+	for (const withSearch of [false, true]) {
+		test(`model generation is not cancelled by the search deadline (search=${withSearch})`, async () => {
+			vi.useFakeTimers()
+			try {
+				let active: AbortSignal | null | undefined
+				let release: (() => void) | undefined
+				const f = fixture({
+					model: async (n, _body, signal) => {
+						active = signal
+						if (withSearch && n === 1) return sse([call()])
+						await new Promise<void>((resolve) => {
+							release = resolve
+						})
+						return sse([message(n)], n)
+					},
+				})
+				const done = f.request({ tool_choice: "auto" }).then(collect)
+				await vi.waitFor(() => expect(release).toBeTypeOf("function"))
+				await vi.advanceTimersByTimeAsync(61_000)
+				expect(active?.aborted).toBe(false)
+				release?.()
+				expect((await done).result.status).toBe("completed")
+				expect(f.requests).toHaveLength(withSearch ? 3 : 1)
+			} finally {
+				vi.useRealTimers()
+			}
+		})
+	}
 
 	test("a continuation HTTP failure does not misreport partial usage as complete", async () => {
 		const f = fixture({

@@ -227,12 +227,16 @@ export async function standaloneSearchResponse(
 	const abort = () => controller.abort(parent?.reason)
 	parent?.addEventListener("abort", abort, { once: true })
 	if (parent?.aborted) abort()
-	const timeout = setTimeout(
-		() => controller.abort(new Error("Search bridge deadline exceeded.")),
-		60_000,
-	)
-	const cleanup = () => {
+	// Model generation is governed by the caller's cancellation policy. Only an
+	// actual standalone search gets this deadline, including its response body.
+	let timeout: ReturnType<typeof setTimeout> | undefined
+	let searchTimedOut = false
+	const stopSearchTimer = () => {
 		clearTimeout(timeout)
+		timeout = undefined
+	}
+	const cleanup = () => {
+		stopSearchTimer()
 		parent?.removeEventListener("abort", abort)
 	}
 	const signal = controller.signal
@@ -489,18 +493,28 @@ export async function standaloneSearchResponse(
 						item_id: activeSearch.id,
 					})
 					searchCalls++
-					const found = await readSearchResult(
-						await fetch("alpha/search", {
-							id: sessionId,
-							model: body.model,
-							commands: {
-								search_query: queries.map((q) => ({ q })),
-								response_length: "short",
-							},
-							settings: prepared.settings,
-							max_output_tokens: 4000,
-						}),
-					)
+					timeout = setTimeout(() => {
+						searchTimedOut = true
+						controller.abort(new Error("Standalone search deadline exceeded."))
+					}, 60_000)
+					const found = await (async () => {
+						try {
+							return await readSearchResult(
+								await fetch("alpha/search", {
+									id: sessionId,
+									model: body.model,
+									commands: {
+										search_query: queries.map((q) => ({ q })),
+										response_length: "short",
+									},
+									settings: prepared.settings,
+									max_output_tokens: 4000,
+								}),
+							)
+						} finally {
+							stopSearchTimer()
+						}
+					})()
 					searchUsage.add(found.usage)
 					const sources = searchSources(found)
 					activeSearch = {
@@ -547,16 +561,20 @@ export async function standaloneSearchResponse(
 			yield emit({
 				type: "response.failed",
 				response: result("failed", {
-					code: signal.aborted
-						? "search_cancelled"
-						: error instanceof SearchBridgeError
-							? error.code
-							: "search_bridge_error",
-					message: signal.aborted
-						? "Standalone search was cancelled or timed out."
-						: error instanceof SearchBridgeError
-							? error.message
-							: "Standalone search could not complete.",
+					code: searchTimedOut
+						? "search_timeout"
+						: signal.aborted
+							? "search_cancelled"
+							: error instanceof SearchBridgeError
+								? error.code
+								: "search_bridge_error",
+					message: searchTimedOut
+						? "Standalone search exceeded its 60-second deadline."
+						: signal.aborted
+							? "The caller cancelled the response."
+							: error instanceof SearchBridgeError
+								? error.message
+								: "Standalone search could not complete.",
 				}),
 			})
 		} finally {
