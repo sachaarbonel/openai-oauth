@@ -539,7 +539,19 @@ describe("opt-in standalone search bridge", () => {
 			status: "completed",
 			operation: { type: "create_file", path: "report.txt", diff: "+Reviewed" },
 		}
-		const f = fixture({ model: () => sse([patch]) })
+		const f = fixture({
+			model: () =>
+				sse([
+					{
+						type: "function_call",
+						id: patch.id,
+						call_id: patch.call_id,
+						status: patch.status,
+						name: "__openai_oauth_apply_patch",
+						arguments: JSON.stringify({ operation: patch.operation }),
+					},
+				]),
+		})
 		const response = await f.request({
 			tools: [
 				{ type: "web_search" },
@@ -552,7 +564,12 @@ describe("opt-in standalone search bridge", () => {
 		expect(result.status).toBe("completed")
 		expect(result.output).toContainEqual(patch)
 		expect(f.requests).toHaveLength(1)
-		expect(JSON.stringify(f.requests[0].body)).toContain('"type":"apply_patch"')
+		expect(JSON.stringify(f.requests[0].body)).toContain(
+			'"name":"__openai_oauth_apply_patch"',
+		)
+		expect(JSON.stringify(f.requests[0].body)).not.toContain(
+			'"type":"apply_patch"',
+		)
 	})
 
 	test("apply_patch cannot bypass tool_choice none", async () => {

@@ -33,6 +33,7 @@ globalThis.fetch = async () => {
 }
 const {
 	Agent,
+	applyPatchTool,
 	OpenAIProvider,
 	Runner,
 	setTracingDisabled,
@@ -527,3 +528,222 @@ for (const { native, nullableOptions } of [
 		},
 	)
 }
+
+test(
+	"SDK apply_patch crosses Lite as a function and executes its native editor once",
+	{ timeout: 10000 },
+	async () => {
+		const root = await mkdtemp(join(tmpdir(), "openai-oauth-patch-fixture-"))
+		try {
+			const authFilePath = join(root, "auth.json")
+			await writeFile(
+				authFilePath,
+				JSON.stringify({
+					tokens: {
+						access_token: "inert-fixture",
+						account_id: "inert-fixture",
+					},
+				}),
+				{ mode: 0o600 },
+			)
+			let requests = 0
+			let edits = 0
+			const patch = {
+				type: "create_file",
+				path: "fixture.txt",
+				diff: "+fixture",
+			}
+			const patchCall = {
+				type: "function_call",
+				id: "fc_patch_fixture",
+				call_id: "call_patch_fixture",
+				name: "__openai_oauth_apply_patch",
+				status: "completed",
+				arguments: JSON.stringify({ operation: patch }),
+			}
+			const modelStream = (ordinal) => {
+				const item =
+					ordinal === 1 ? patchCall : message("fixture applied", "final_answer")
+				const response = {
+					id: `resp_patch_${ordinal}`,
+					object: "response",
+					created_at: 1,
+					model,
+					status: "in_progress",
+					output: [],
+				}
+				const events = [
+					{ type: "response.created", response },
+					{
+						type: "response.output_item.added",
+						output_index: 0,
+						item: {
+							...item,
+							status: "in_progress",
+							...(ordinal === 1 ? { arguments: "" } : { content: [] }),
+						},
+					},
+				]
+				if (ordinal === 1)
+					events.push(
+						{
+							type: "response.function_call_arguments.delta",
+							output_index: 0,
+							item_id: item.id,
+							delta: patchCall.arguments,
+						},
+						{
+							type: "response.function_call_arguments.done",
+							output_index: 0,
+							item_id: item.id,
+							arguments: patchCall.arguments,
+						},
+					)
+				else
+					events.push({
+						type: "response.output_text.delta",
+						output_index: 0,
+						item_id: item.id,
+						content_index: 0,
+						delta: "fixture applied",
+						logprobs: [],
+					})
+				events.push(
+					{ type: "response.output_item.done", output_index: 0, item },
+					{
+						type: "response.completed",
+						response: {
+							...response,
+							status: "completed",
+							output: [],
+							usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
+						},
+					},
+				)
+				return new Response(
+					events
+						.map((event, sequence_number) =>
+							encodeEvent({ ...event, sequence_number }),
+						)
+						.join(""),
+					{ headers: { "content-type": "text/event-stream" } },
+				)
+			}
+			const handler = createOpenAIOAuthFetchHandler({
+				authFilePath,
+				ensureFresh: false,
+				codexVersion: "0.144.1",
+				models: [model],
+				fetch: async (url, init) => {
+					const pathname = new URL(String(url)).pathname
+					if (pathname === "/backend-api/codex/models")
+						return Response.json({
+							models: [{ slug: model, use_responses_lite: true }],
+						})
+					assert.equal(pathname, "/backend-api/codex/responses")
+					assert.ok(++requests <= 2, "No retries or additional model requests")
+					const body = JSON.parse(init.body)
+					const definitions = [
+						...(body.tools ?? []),
+						...body.input.flatMap((item) =>
+							item.type === "additional_tools" ? item.tools : [],
+						),
+					]
+					if (definitions.some((tool) => tool.type === "apply_patch"))
+						return Response.json(
+							{ error: "Unsupported tool type: apply_patch" },
+							{ status: 400 },
+						)
+					assert.deepEqual(
+						definitions.map((tool) => tool.type),
+						["function", "function", "function", "function", "function"],
+					)
+					assert.ok(
+						definitions.some(
+							(tool) => tool.name === "__openai_oauth_apply_patch",
+						),
+					)
+					if (requests === 2) {
+						assert.equal(edits, 1)
+						const replay = body.input.find(
+							(item) =>
+								item.type === "function_call" &&
+								item.name === "__openai_oauth_apply_patch",
+						)
+						assert.equal(replay.call_id, patchCall.call_id)
+						assert.deepEqual(JSON.parse(replay.arguments), { operation: patch })
+						const result = body.input.find(
+							(item) =>
+								item.type === "function_call_output" &&
+								item.call_id === patchCall.call_id,
+						)
+						assert.match(result.output, /fixture applied/)
+					}
+					return modelStream(requests)
+				},
+			})
+			const client = new OpenAI({
+				apiKey: "inert-fixture",
+				baseURL: "http://fixture.invalid/v1",
+				maxRetries: 0,
+				fetch: async (url, init) => {
+					assert.equal(String(url), "http://fixture.invalid/v1/responses")
+					const headers = new Headers(init.headers)
+					headers.delete("authorization")
+					return handler(new Request(url, { ...init, headers }))
+				},
+			})
+			const agent = new Agent({
+				name: "Patch fixture",
+				model,
+				instructions: "Apply the fixture patch once.",
+				modelSettings: { store: false },
+				tools: [
+					...Array.from({ length: 4 }, (_, index) =>
+						tool({
+							name: `fixture_tool_${index}`,
+							description: "Inert fixture tool",
+							parameters: z.object({}),
+							execute: async () => {
+								throw new Error("Unexpected function tool call")
+							},
+						}),
+					),
+					applyPatchTool({
+						editor: {
+							createFile: async (operation) => {
+								assert.deepEqual(operation, patch)
+								edits++
+								return { output: "fixture applied" }
+							},
+							updateFile: async () => {
+								throw new Error("Unexpected update")
+							},
+							deleteFile: async () => {
+								throw new Error("Unexpected delete")
+							},
+						},
+					}),
+				],
+			})
+			const runner = new Runner({
+				modelProvider: new OpenAIProvider({ openAIClient: client }),
+				tracingDisabled: true,
+			})
+			const result = await runner.run(agent, "Apply the fixture patch.", {
+				stream: true,
+				maxTurns: 2,
+				signal: AbortSignal.timeout(5000),
+			})
+			for await (const _event of result) {
+				/* Consume the real SDK stream. */
+			}
+			await result.completed
+			assert.equal(result.finalOutput, "fixture applied")
+			assert.equal(edits, 1)
+			assert.equal(requests, 2)
+		} finally {
+			await rm(root, { recursive: true, force: true })
+		}
+	},
+)

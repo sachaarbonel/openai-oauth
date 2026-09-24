@@ -1,3 +1,9 @@
+import {
+	adaptPatchInput,
+	adaptPatchResponsesSse,
+	applyPatchFunction,
+	selectPatchFunctionName,
+} from "./apply-patch-bridge.js"
 import { CODEX_IMAGE_MODEL, prepareCodexImageRequest } from "./images.js"
 import {
 	type CodexModelInfo,
@@ -619,14 +625,40 @@ const applyModelDefaults = (
 		return
 	}
 
-	const input = Array.isArray(normalized.input) ? [...normalized.input] : []
+	const originalInput = Array.isArray(normalized.input) ? normalized.input : []
 	const prefix: unknown[] = []
 	const tools = Array.isArray(normalized.tools) ? normalized.tools : []
-	const functionTools = tools.filter(
-		(tool) => isRecord(tool) && tool.type === "function",
+	const hasPatch = tools.some(
+		(tool) => isRecord(tool) && tool.type === "apply_patch",
+	)
+	const patchName = selectPatchFunctionName(tools, originalInput)
+	const input = originalInput.map((item) => adaptPatchInput(item, patchName))
+	if (hasPatch) {
+		const existing = input.findIndex(
+			(item) => isRecord(item) && item.type === "additional_tools",
+		)
+		if (existing >= 0 && isRecord(input[existing])) {
+			const item = input[existing]
+			input[existing] = {
+				...item,
+				tools: [
+					...(Array.isArray(item.tools) ? item.tools : []),
+					applyPatchFunction(patchName),
+				],
+			}
+		}
+	}
+	const functionTools = tools.flatMap((tool) =>
+		isRecord(tool) && tool.type === "apply_patch"
+			? [applyPatchFunction(patchName)]
+			: isRecord(tool) && tool.type === "function"
+				? [tool]
+				: [],
 	)
 	const hostedTools = tools.filter(
-		(tool) => !isRecord(tool) || tool.type !== "function",
+		(tool) =>
+			!isRecord(tool) ||
+			(tool.type !== "function" && tool.type !== "apply_patch"),
 	)
 	if (
 		functionTools.length > 0 &&
@@ -689,6 +721,7 @@ type PreparedResponsesRequestBody = {
 	requestBody?: Record<string, unknown>
 	wantsStream?: boolean
 	useResponsesLite?: boolean
+	patchToolName?: string
 }
 
 type ResolveModelInfo = (
@@ -755,11 +788,23 @@ const prepareResponsesRequestBody = async (
 
 		const expanded = state?.expandRequestBody(normalized) ?? normalized
 
+		const patchToolName =
+			modelInfo?.useResponsesLite === true &&
+			Array.isArray(parsed.tools) &&
+			parsed.tools.some(
+				(tool: unknown) => isRecord(tool) && tool.type === "apply_patch",
+			)
+				? selectPatchFunctionName(
+						parsed.tools,
+						Array.isArray(parsed.input) ? parsed.input : [],
+					)
+				: undefined
 		return {
 			body: JSON.stringify(expanded),
 			requestBody: expanded,
 			wantsStream,
 			useResponsesLite: modelInfo?.useResponsesLite === true,
+			patchToolName,
 		}
 	} catch {
 		return { body }
@@ -810,10 +855,14 @@ const finalizeResponsesResponse = async (
 	}
 
 	if (prepared.wantsStream) {
+		const stream = normalizeResponsesSse(response.body)
+		const adapted = prepared.patchToolName
+			? adaptPatchResponsesSse(stream, prepared.patchToolName)
+			: stream
 		const headers = new Headers(response.headers)
 		headers.delete("content-encoding")
 		headers.delete("content-length")
-		const normalized = new Response(normalizeResponsesSse(response.body), {
+		const normalized = new Response(adapted, {
 			status: response.status,
 			statusText: response.statusText,
 			headers,
@@ -821,7 +870,11 @@ const finalizeResponsesResponse = async (
 		return captureResponsesState(normalized, prepared.requestBody, state)
 	}
 
-	const completed = await collectCompletedResponseFromSse(response.body)
+	const completed = await collectCompletedResponseFromSse(
+		prepared.patchToolName
+			? adaptPatchResponsesSse(normalizeResponsesSse(response.body), prepared.patchToolName)
+			: response.body,
+	)
 	state?.rememberResponse(completed, prepared.requestBody)
 	const headers = new Headers(response.headers)
 	headers.delete("content-encoding")
