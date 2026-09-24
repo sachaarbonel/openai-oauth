@@ -116,7 +116,9 @@ function prepare(body: Json) {
 		declared.some(
 			(tool) =>
 				!isRecord(tool) ||
-				!["function", "custom", "namespace"].includes(String(tool.type)),
+				!["function", "custom", "namespace", "apply_patch"].includes(
+					String(tool.type),
+				),
 		)
 	)
 		throw new SearchBridgeError(
@@ -385,7 +387,11 @@ export async function standaloneSearchResponse(
 						calls.push(item)
 						continue
 					}
-					if (item.type === "function_call" || item.type === "custom_tool_call")
+					if (
+						item.type === "function_call" ||
+						item.type === "custom_tool_call" ||
+						item.type === "apply_patch_call"
+					)
 						externalCalls++
 					const buffered = functions.get(index)
 					if (buffered) {

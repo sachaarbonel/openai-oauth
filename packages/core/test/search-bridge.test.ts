@@ -502,6 +502,54 @@ describe("opt-in standalone search bridge", () => {
 		expect(f.requests).toHaveLength(1)
 	})
 
+	test("passes sandbox apply_patch calls back without executing or dropping them", async () => {
+		const patch = {
+			type: "apply_patch_call",
+			id: "ap_fixture",
+			call_id: "patch_fixture",
+			status: "completed",
+			operation: { type: "create_file", path: "report.txt", diff: "+Reviewed" },
+		}
+		const f = fixture({ model: () => sse([patch]) })
+		const response = await f.request({
+			tools: [
+				{ type: "web_search" },
+				{ type: "apply_patch" },
+				{ type: "function", name: "exec_command" },
+			],
+		})
+		expect(response.status).toBe(200)
+		const { result } = await collect(response)
+		expect(result.status).toBe("completed")
+		expect(result.output).toContainEqual(patch)
+		expect(f.requests).toHaveLength(1)
+		expect(JSON.stringify(f.requests[0].body)).toContain('"type":"apply_patch"')
+	})
+
+	test("apply_patch cannot bypass tool_choice none", async () => {
+		const f = fixture({
+			model: () =>
+				sse([
+					{
+						type: "apply_patch_call",
+						id: "ap_fixture",
+						call_id: "patch_fixture",
+						status: "completed",
+						operation: { type: "delete_file", path: "report.txt" },
+					},
+				]),
+		})
+		const response = await f.request({
+			tool_choice: "none",
+			tools: [{ type: "web_search" }, { type: "apply_patch" }],
+		})
+		expect(response.status).toBe(200)
+		const { result } = await collect(response)
+		expect(result.status).toBe("failed")
+		expect(result.error.code).toBe("unexpected_tool_call")
+		expect(f.requests).toHaveLength(1)
+	})
+
 	test("does not bridge other models or opt-out requests", async () => {
 		for (const options of [{ enabled: false }, { lite: false }]) {
 			const f = fixture({ ...options, model: () => sse([message()]) })
