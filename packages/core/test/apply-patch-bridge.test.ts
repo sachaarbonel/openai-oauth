@@ -1,5 +1,8 @@
 import { describe, expect, test, vi } from "vitest"
-import { adaptPatchResponsesSse } from "../src/apply-patch-bridge.js"
+import {
+	adaptPatchInput,
+	adaptPatchResponsesSse,
+} from "../src/apply-patch-bridge.js"
 import { createOpenAIOAuthTransport } from "../src/runtime.js"
 
 const patchCall = {
@@ -52,6 +55,39 @@ const stream = () =>
 	)
 
 describe("Responses Lite apply_patch compatibility", () => {
+	test.each([
+		["completed with text", "completed", "patch applied", "patch applied"],
+		["completed without text", "completed", undefined, ""],
+		["failed with text", "failed", "patch failed", "patch failed"],
+		["failed without text", "failed", undefined, ""],
+	] as const)("normalizes native patch result: %s", (_label, status, output, expectedOutput) => {
+		const native = {
+			type: "apply_patch_call_output",
+			call_id: "call_patch_fixture",
+			status,
+			...(output === undefined ? {} : { output }),
+		}
+		const normalized = JSON.parse(
+			JSON.stringify(adaptPatchInput(native, patchCall.name)),
+		)
+		expect(normalized).toEqual({
+			type: "function_call_output",
+			call_id: native.call_id,
+			status,
+			output: expectedOutput,
+		})
+	})
+
+	test("leaves ordinary function results unchanged", () => {
+		const ordinary = {
+			type: "function_call_output",
+			call_id: "call_ordinary_fixture",
+			output: "ordinary result",
+			status: "completed",
+		}
+		expect(adaptPatchInput(ordinary, patchCall.name)).toBe(ordinary)
+	})
+
 	test("adapts a rejected native declaration and returns a native patch call", async () => {
 		const upstream = vi.fn(
 			async (url: RequestInfo | URL, init?: RequestInit) => {

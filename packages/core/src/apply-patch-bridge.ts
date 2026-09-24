@@ -70,11 +70,12 @@ export const adaptPatchInput = (item: unknown, name: string): unknown => {
 		}
 	}
 	if (item.type === "apply_patch_call_output") {
+		// Native patch output is optional; Lite function output requires a string.
 		return {
 			type: "function_call_output",
 			id: item.id,
 			call_id: item.call_id,
-			output: item.output,
+			output: typeof item.output === "string" ? item.output : "",
 			status: item.status,
 		}
 	}
