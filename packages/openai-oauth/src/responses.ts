@@ -55,6 +55,5 @@ export const handleResponsesRequest = async (
 		await record("transport_or_auth", new Response(null, { status: 500 }), body)
 		throw error
 	}
-	await record("upstream_response", upstream, body)
-	return copyUpstreamResponse(upstream)
+	return record("upstream_response", copyUpstreamResponse(upstream), body)
 }

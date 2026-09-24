@@ -4,6 +4,7 @@ import {
 	summarizeRequestTools,
 	upstreamRequestSummary,
 } from "./responses-request-diagnostics.js"
+import { observeResponsesStream } from "./responses-stream-diagnostics.js"
 import { isRecord } from "./shared.js"
 
 type Stage = "proxy_validation" | "upstream_response" | "transport_or_auth"
@@ -315,7 +316,7 @@ const readSummary = async (response: Response) => {
 }
 
 // Explicit opt-in; first eight requests per runtime, <=16 KiB/1s per rejection.
-// Successful SSE bodies are never read. Return the original response unchanged.
+// Stream metadata is observed only as the Node response writer forwards bytes.
 export const createResponsesDiagnostics = (
 	enabled = process.env.CODEX_OPENAI_RESPONSES_DIAGNOSTICS === "1",
 	write: (line: string) => void = (line) => console.log(line),
@@ -348,7 +349,9 @@ export const createResponsesDiagnostics = (
 			} catch {
 				/* Diagnostics must not affect the request. */
 			}
-			return response
+			return stage === "upstream_response"
+				? observeResponsesStream(response, requestId, write)
+				: response
 		}
 	}
 }

@@ -22,6 +22,7 @@ import {
 	observeResponsesFetch,
 	withResponsesRequestDiagnostics,
 } from "./responses-request-diagnostics.js"
+import { getResponsesStreamObserver } from "./responses-stream-diagnostics.js"
 import {
 	DEFAULT_HOST,
 	DEFAULT_PORT,
@@ -149,13 +150,17 @@ export const startOpenAIOAuthServer = async (
 	const handler = runtime.handler
 	const server = createServer(async (req, res) => {
 		const controller = new AbortController()
+		let streamObserver: ReturnType<typeof getResponsesStreamObserver>
 		const abort = () => controller.abort()
 		req.once("aborted", abort)
 		res.once("close", () => {
 			req.off("aborted", abort)
 			// IncomingMessage.close also fires after a normal POST body is read.
 			// Only an unfinished outgoing response indicates a disconnected client.
-			if (!res.writableFinished) abort()
+			if (!res.writableFinished) {
+				abort()
+				streamObserver?.finish("client_closed")
+			}
 		})
 		try {
 			const request = await toWebRequest(req, {
@@ -165,8 +170,24 @@ export const startOpenAIOAuthServer = async (
 			})
 			controller.signal.throwIfAborted()
 			const response = await handler(request)
-			await writeWebResponse(res, response, controller.signal)
+			streamObserver = getResponsesStreamObserver(response)
+			await writeWebResponse(res, response, controller.signal, (chunk) => {
+				try {
+					streamObserver?.chunk(chunk)
+				} catch {
+					/* Diagnostic inspection must not interrupt forwarding. */
+				}
+			})
+			streamObserver?.finish(
+				controller.signal.aborted ? "client_closed" : "forwarded",
+			)
 		} catch (error) {
+			streamObserver?.finish(
+				controller.signal.aborted || res.destroyed
+					? "client_closed"
+					: "forward_error",
+				error,
+			)
 			if (controller.signal.aborted || res.destroyed) return
 			if (res.headersSent || res.writableEnded) {
 				res.destroy(error instanceof Error ? error : undefined)

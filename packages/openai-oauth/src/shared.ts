@@ -190,6 +190,7 @@ export const writeWebResponse = async (
 	response: ServerResponse,
 	webResponse: Response,
 	signal: AbortSignal,
+	onChunk?: (value: Uint8Array) => void,
 ): Promise<void> => {
 	if (signal.aborted || response.destroyed) {
 		void webResponse.body?.cancel(signal.reason).catch(() => {})
@@ -222,6 +223,7 @@ export const writeWebResponse = async (
 			}
 
 			if (!signal.aborted && !response.destroyed) {
+				onChunk?.(value)
 				response.write(Buffer.from(value))
 			}
 		}

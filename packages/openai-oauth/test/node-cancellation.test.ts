@@ -63,6 +63,8 @@ describe("Node HTTP cancellation", () => {
 		running = undefined
 		await rm(root, { recursive: true, force: true })
 		vi.unstubAllGlobals()
+		vi.unstubAllEnvs()
+		vi.restoreAllMocks()
 	})
 
 	const connect = async (
@@ -159,6 +161,8 @@ describe("Node HTTP cancellation", () => {
 		{ name: "mid-stream", sendInitialChunk: true, reject: false },
 		{ name: "with rejecting cleanup", sendInitialChunk: true, reject: true },
 	])("disconnect $name aborts fetch and cancels the stalled body", async (scenario) => {
+		vi.stubEnv("CODEX_OPENAI_RESPONSES_DIAGNOSTICS", "1")
+		const logs = vi.spyOn(console, "log").mockImplementation(() => {})
 		const fixture = stalledBody(scenario.sendInitialChunk, scenario.reject)
 		const { client, started, received } = await connect(() => fixture.response)
 		const signal = await bounded(started.promise)
@@ -174,6 +178,17 @@ describe("Node HTTP cancellation", () => {
 			expect(signal.aborted).toBe(true)
 			expect(fixture.cancel).toHaveBeenCalledExactlyOnceWith(signal.reason)
 			expect(fixture.body.locked).toBe(false)
+		})
+		await vi.waitFor(() => {
+			const streamLog = logs.mock.calls
+				.map(([line]) => JSON.parse(String(line)))
+				.find(
+					(line) => line.source === "openai-oauth-responses-stream-diagnostic",
+				)
+			expect(streamLog).toMatchObject({
+				outcome: "client_closed",
+				terminal: "not_observed",
+			})
 		})
 	})
 
@@ -194,6 +209,8 @@ describe("Node HTTP cancellation", () => {
 	})
 
 	test("normal request and response completion preserves bytes without aborting", async () => {
+		vi.stubEnv("CODEX_OPENAI_RESPONSES_DIAGNOSTICS", "1")
+		const logs = vi.spyOn(console, "log").mockImplementation(() => {})
 		const bytes = Buffer.from(
 			'event: response.completed\ndata: {"type":"response.completed","response":{"output":[]}}\n\n',
 		)
@@ -230,5 +247,54 @@ describe("Node HTTP cancellation", () => {
 		expect(Buffer.concat(chunks)).toEqual(bytes)
 		expect(signal.aborted).toBe(false)
 		expect(cancel).not.toHaveBeenCalled()
+		const headerLog = logs.mock.calls
+			.map(([line]) => JSON.parse(String(line)))
+			.find((line) => line.source === "openai-oauth-responses-diagnostic")
+		const streamLog = logs.mock.calls
+			.map(([line]) => JSON.parse(String(line)))
+			.find(
+				(line) => line.source === "openai-oauth-responses-stream-diagnostic",
+			)
+		expect(streamLog).toMatchObject({
+			requestId: headerLog.requestId,
+			outcome: "forwarded",
+			terminal: "response.completed",
+			itemTypes: [],
+			toolNames: [],
+		})
+	})
+
+	test("logs a forwarding exception without its message", async () => {
+		vi.stubEnv("CODEX_OPENAI_RESPONSES_DIAGNOSTICS", "1")
+		const logs = vi.spyOn(console, "log").mockImplementation(() => {})
+		const { started, received } = await connect(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(initialChunk)
+							queueMicrotask(() =>
+								controller.error(new Error("PRIVATE_CREDENTIAL")),
+							)
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
+				),
+		)
+		await bounded(started.promise)
+		await bounded(received.promise).catch(() => undefined)
+		await vi.waitFor(() => {
+			const streamLog = logs.mock.calls
+				.map(([line]) => JSON.parse(String(line)))
+				.find(
+					(line) => line.source === "openai-oauth-responses-stream-diagnostic",
+				)
+			expect(streamLog).toMatchObject({
+				outcome: "forward_error",
+				terminal: "not_observed",
+				errorName: "Error",
+			})
+			expect(JSON.stringify(streamLog)).not.toContain("PRIVATE")
+		})
 	})
 })
