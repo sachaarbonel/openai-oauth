@@ -275,13 +275,65 @@ describe("bounded Responses diagnostics", () => {
 		})
 		expect(write.mock.calls[1][0]).not.toContain("PRIVATE")
 	})
-	test("requires opt-in and caps each runtime at eight requests", async () => {
+	test("requires opt-in, bounds concurrent rejections, reports suppression, and renews capture", async () => {
 		expect(createResponsesDiagnostics(false)()).toBeUndefined()
 		const write = vi.fn()
-		const begin = createResponsesDiagnostics(true, write)
-		for (let i = 0; i < 10; i++)
-			await begin()?.("proxy_validation", new Response(null, { status: 400 }))
-		expect(write).toHaveBeenCalledTimes(8)
+		let time = 0
+		const begin = createResponsesDiagnostics(true, write, () => time)
+		await Promise.all(
+			Array.from({ length: 10 }, () =>
+				begin()?.(
+					"upstream_response",
+					Response.json(
+						{ detail: "Unsupported parameter: service_tier" },
+						{ status: 400 },
+					),
+				),
+			),
+		)
+		const entries = write.mock.calls.map(([line]) => JSON.parse(line))
+		expect(entries.filter((entry) => entry.rejection)).toHaveLength(8)
+		expect(
+			entries.find((entry) => entry.category === "rejection"),
+		).toMatchObject({
+			source: "openai-oauth-responses-diagnostic-limit",
+			resumesAt: "1970-01-01T00:01:00.000Z",
+		})
+		expect(write).toHaveBeenCalledTimes(9)
+		time = 60_000
+		await begin()?.(
+			"upstream_response",
+			Response.json(
+				{ detail: "Unsupported parameter: service_tier" },
+				{ status: 400 },
+			),
+		)
+		expect(
+			JSON.parse(write.mock.calls.at(-1)?.[0]).rejection.param,
+		).toBeUndefined()
+		expect(JSON.parse(write.mock.calls.at(-1)?.[0]).rejection.reason).toBe(
+			"unsupported_parameter",
+		)
+		expect(write).toHaveBeenCalledTimes(10)
+	})
+
+	test("successful requests cannot exhaust rejection diagnostics", async () => {
+		const write = vi.fn()
+		const begin = createResponsesDiagnostics(true, write, () => 0)
+		for (let i = 0; i < 20; i++)
+			await begin()?.("upstream_response", new Response(null))
+		const response = Response.json(
+			{ detail: "Unsupported parameter: service_tier" },
+			{ status: 400 },
+		)
+		expect(await begin()?.("upstream_response", response)).toBe(response)
+		expect(JSON.parse(write.mock.calls.at(-1)?.[0])).toMatchObject({
+			status: 400,
+			rejection: { reason: "unsupported_parameter" },
+		})
+		expect(await response.json()).toEqual({
+			detail: "Unsupported parameter: service_tier",
+		})
 	})
 
 	test("reports safe rejection identifiers without changing the response", async () => {

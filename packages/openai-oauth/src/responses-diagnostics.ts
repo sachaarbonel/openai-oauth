@@ -315,18 +315,52 @@ const readSummary = async (response: Response) => {
 	}
 }
 
-// Explicit opt-in; first eight requests per runtime, <=16 KiB/1s per rejection.
+// Explicit opt-in; independent success/rejection budgets renew every minute.
+// Each rejection remains limited to 16 KiB/1s of inspection.
 // Stream metadata is observed only as the Node response writer forwards bytes.
 export const createResponsesDiagnostics = (
 	enabled = process.env.CODEX_OPENAI_RESPONSES_DIAGNOSTICS === "1",
 	write: (line: string) => void = (line) => console.log(line),
+	now: () => number = Date.now,
 ): (() => ResponseDiagnostic | undefined) => {
-	let remaining = 8
+	const budgets = {
+		success: { started: now(), used: 0 },
+		rejection: { started: now(), used: 0 },
+	}
 	return () => {
-		if (!enabled || remaining-- <= 0) return undefined
+		if (!enabled) return undefined
 		const requestId = randomUUID()
 		const started = Date.now()
 		return async (stage, response, requestBody) => {
+			const category = response.ok ? "success" : "rejection"
+			const budget = budgets[category]
+			const timestamp = now()
+			if (timestamp - budget.started >= 60_000) {
+				budget.started = timestamp
+				budget.used = 0
+			}
+			// Reserve before awaiting body inspection, including concurrent requests.
+			if (budget.used++ >= 8) {
+				if (budget.used === 9) {
+					try {
+						write(
+							JSON.stringify({
+								source: "openai-oauth-responses-diagnostic-limit",
+								timestamp: new Date(timestamp).toISOString(),
+								requestId,
+								category,
+								status: response.status,
+								reason:
+									"Eight diagnostics captured in this category; further details withheld until reset.",
+								resumesAt: new Date(budget.started + 60_000).toISOString(),
+							}),
+						)
+					} catch {
+						/* Diagnostics must not affect the request. */
+					}
+				}
+				return response
+			}
 			try {
 				write(
 					JSON.stringify({
