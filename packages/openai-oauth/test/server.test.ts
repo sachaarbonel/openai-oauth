@@ -29,6 +29,61 @@ describe("openai oauth server", () => {
 		vi.restoreAllMocks()
 	})
 
+	test("wires opt-in diagnostics to the normalized upstream request", async () => {
+		const authFilePath = await createAuthFile()
+		const log = vi.spyOn(console, "log").mockImplementation(() => {})
+		vi.stubEnv("CODEX_OPENAI_RESPONSES_DIAGNOSTICS", "1")
+		try {
+			const handler = createOpenAIOAuthFetchHandler({
+				authFilePath,
+				ensureFresh: false,
+				fetch: async (input) => {
+					const url = String(input)
+					if (url === "https://registry.npmjs.org/@openai/codex/latest")
+						return Response.json({ version: "0.144.1" })
+					if (url.includes("/models?"))
+						return Response.json({
+							models: [{ slug: "gpt-6-astra", use_responses_lite: true }],
+						})
+					expect(url).toBe("https://chatgpt.com/backend-api/codex/responses")
+					return Response.json(
+						{ error: { code: "unsupported_value", param: "tools" } },
+						{ status: 400 },
+					)
+				},
+			})
+			const response = await handler(
+				new Request("http://fixture.invalid/v1/responses", {
+					method: "POST",
+					body: JSON.stringify({
+						model: "gpt-6-astra",
+						stream: true,
+						tools: [
+							{ type: "function", name: "PRIVATE" },
+							{ type: "web_search" },
+						],
+					}),
+				}),
+			)
+			expect(response.status).toBe(400)
+			expect(log).toHaveBeenCalledTimes(1)
+			expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
+				upstreamRequest: {
+					responsesLite: true,
+					capture: "captured",
+					tools: {
+						topLevel: { types: ["web_search"] },
+						additionalTools: [{ types: ["function"] }],
+					},
+				},
+			})
+			expect(log.mock.calls[0][0]).not.toContain("PRIVATE")
+		} finally {
+			vi.unstubAllEnvs()
+			await fs.rm(path.dirname(authFilePath), { recursive: true, force: true })
+		}
+	})
+
 	test("lists configured models", async () => {
 		const handler = createOpenAIOAuthFetchHandler({
 			models: ["gpt-5.2", "gpt-5.1-codex"],

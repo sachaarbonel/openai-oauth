@@ -1,12 +1,231 @@
-import type { OpenAIOAuthTransport } from "@openai-oauth/core"
+import {
+	createOpenAIOAuthTransport,
+	type OpenAIOAuthTransport,
+} from "@openai-oauth/core"
 import { describe, expect, test, vi } from "vitest"
 import { handleResponsesRequest } from "../src/responses.js"
 import {
 	createResponsesDiagnostics,
 	summarizeRejection,
 } from "../src/responses-diagnostics.js"
+import {
+	observeResponsesFetch,
+	summarizeRequestTools,
+	withResponsesRequestDiagnostics,
+} from "../src/responses-request-diagnostics.js"
 
 describe("bounded Responses diagnostics", () => {
+	test("records the actual Lite tool split and preserves one unsupported-tools rejection", async () => {
+		const write = vi.fn()
+		const upstream = vi.fn(
+			async (_input: RequestInfo | URL, init?: RequestInit) => {
+				const body = JSON.parse(String(init?.body))
+				expect(body.tools).toEqual([
+					{
+						type: "web_search",
+						filters: { allowed_domains: ["PRIVATE_DOMAIN"] },
+					},
+				])
+				// Synthetic negative fixture matching the observed structured fields,
+				// not a reconstruction of the missing upstream message or allowed list.
+				return Response.json(
+					{
+						error: {
+							type: "invalid_request_error",
+							code: "unsupported_value",
+							param: "tools",
+							message: "Unsupported tool type: web_search",
+						},
+					},
+					{ status: 400 },
+				)
+			},
+		)
+		const client = createOpenAIOAuthTransport({
+			auth: {
+				accessToken: "PRIVATE_ACCESS_TOKEN",
+				accountId: "PRIVATE_ACCOUNT",
+			},
+			codexVersion: "0.144.1",
+			fetch: observeResponsesFetch(async (input, init) => {
+				if (String(input).includes("/models?"))
+					return Response.json({
+						models: [{ slug: "gpt-6-astra", use_responses_lite: true }],
+					})
+				expect(String(input)).toBe(
+					"https://chatgpt.com/backend-api/codex/responses",
+				)
+				return upstream(input, init)
+			}),
+		})
+		const request = new Request("http://fixture.invalid/v1/responses", {
+			method: "POST",
+			body: JSON.stringify({
+				model: "gpt-6-astra",
+				input: "PRIVATE_PROMPT",
+				stream: true,
+				tool_choice: "required",
+				tools: [
+					{
+						type: "function",
+						name: "PRIVATE_FUNCTION",
+						parameters: { secret: "PRIVATE_SCHEMA" },
+					},
+					{
+						type: "web_search",
+						filters: { allowed_domains: ["PRIVATE_DOMAIN"] },
+					},
+				],
+			}),
+		})
+		const response = await withResponsesRequestDiagnostics(true, () =>
+			handleResponsesRequest(
+				request,
+				client,
+				createResponsesDiagnostics(true, write)(),
+			),
+		)
+		expect(upstream).toHaveBeenCalledTimes(1)
+		expect(response.status).toBe(400)
+		expect(await response.json()).toMatchObject({
+			error: { code: "unsupported_value", param: "tools" },
+		})
+		const log = write.mock.calls[0][0]
+		expect(JSON.parse(log)).toMatchObject({
+			stage: "upstream_response",
+			status: 400,
+			request: {
+				tools: { topLevel: { count: 2, types: ["function", "web_search"] } },
+			},
+			upstreamRequest: {
+				capture: "captured",
+				responsesLite: true,
+				tools: {
+					topLevel: { count: 1, types: ["web_search"] },
+					additionalTools: [{ count: 1, types: ["function"] }],
+				},
+			},
+			rejection: {
+				type: "invalid_request_error",
+				code: "unsupported_value",
+				param: "tools",
+			},
+		})
+		expect(log).not.toContain("PRIVATE")
+	})
+
+	test("retains public tool enum words without treating them as confirmed capabilities", () => {
+		// Both alternatives are synthetic; the third type in the real error is unknown.
+		for (const third of ["namespaces", "web_search_preview"]) {
+			const summary = summarizeRejection({
+				error: {
+					message: `Only supports function tools custom tools and ${third}. Authorization: Bearer PRIVATE`,
+				},
+			})
+			expect(summary.messageSummary).toBe(
+				`only supports function tools custom tools and ${third} [redacted]`,
+			)
+		}
+	})
+
+	test("bounds tool summaries and never emits arbitrary identifiers", () => {
+		const summary = summarizeRequestTools({
+			tools: [
+				{ type: "PRIVATE_TYPE" },
+				null,
+				{
+					type: "namespace",
+					name: "PRIVATE_NAMESPACE",
+					tools: [{ name: "PRIVATE_TOOL" }],
+				},
+			],
+			input: Array(200).fill({ type: "message", content: "PRIVATE" }),
+		})
+		expect(summary).toMatchObject({
+			topLevel: { types: ["unknown", "namespace"] },
+			inputScanTruncated: true,
+		})
+		expect(JSON.stringify(summary)).not.toContain("PRIVATE")
+		expect(
+			summarizeRequestTools({ tools: Array(200).fill({ type: "custom" }) })
+				.topLevel,
+		).toMatchObject({ count: 200, types: ["custom"], truncated: true })
+	})
+
+	test("isolates concurrent summaries and leaves successful streams untouched", async () => {
+		const write = vi.fn()
+		const begin = createResponsesDiagnostics(true, write)
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const transport = vi.fn(
+			async (_input: RequestInfo | URL, init?: RequestInit) => {
+				if (String(init?.body).includes("web_search")) await gate
+				else release()
+				return new Response(new ReadableStream<Uint8Array>())
+			},
+		)
+		const observed = observeResponsesFetch(transport)
+		const run = (type: string) =>
+			withResponsesRequestDiagnostics(true, async () => {
+				const record = begin()
+				const init = {
+					method: "POST",
+					body: JSON.stringify({ tools: [{ type }] }),
+					signal: new AbortController().signal,
+				}
+				const response = await observed(
+					"https://fixture.invalid/responses",
+					init,
+				)
+				await record?.("upstream_response", response, { tools: [{ type }] })
+				expect(response.bodyUsed).toBe(false)
+				expect(transport).toHaveBeenCalledWith(
+					"https://fixture.invalid/responses",
+					init,
+				)
+				await response.body?.cancel()
+			})
+		await Promise.all([run("web_search"), run("custom")])
+		for (const [line] of write.mock.calls) {
+			const log = JSON.parse(line)
+			expect(log.upstreamRequest.tools.topLevel).toEqual(
+				log.request.tools.topLevel,
+			)
+		}
+		expect(write).toHaveBeenCalledTimes(2)
+	})
+
+	test("marks oversized or unreadable request capture unavailable without changing transport", async () => {
+		for (const body of ["{", " ".repeat(1_048_577), new ReadableStream()]) {
+			const write = vi.fn()
+			const transport = vi.fn(async () => new Response(null, { status: 400 }))
+			await withResponsesRequestDiagnostics(true, async () => {
+				const response = await observeResponsesFetch(transport)(
+					"https://fixture.invalid/responses",
+					{ body },
+				)
+				await createResponsesDiagnostics(true, write)()?.(
+					"upstream_response",
+					response,
+				)
+			})
+			expect(transport).toHaveBeenCalledExactlyOnceWith(
+				"https://fixture.invalid/responses",
+				{ body },
+			)
+			expect(JSON.parse(write.mock.calls[0][0]).upstreamRequest).toEqual({
+				responsesLite: false,
+				capture: "unavailable",
+			})
+			if (body instanceof ReadableStream) {
+				expect(body.locked).toBe(false)
+				await body.cancel()
+			}
+		}
+	})
+
 	test("distinguishes proxy validation from one upstream rejection without retries", async () => {
 		const write = vi.fn()
 		const begin = createResponsesDiagnostics(true, write)

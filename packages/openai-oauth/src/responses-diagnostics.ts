@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto"
+import {
+	diagnosticToolTypes,
+	summarizeRequestTools,
+	upstreamRequestSummary,
+} from "./responses-request-diagnostics.js"
 import { isRecord } from "./shared.js"
 
 type Stage = "proxy_validation" | "upstream_response" | "transport_or_auth"
@@ -9,6 +14,7 @@ export type ResponseDiagnostic = (
 ) => Promise<Response>
 
 const safeWords = new Set([
+	...diagnosticToolTypes,
 	"invalid_request_error",
 	"invalid_function_parameters",
 	"invalid_type",
@@ -105,7 +111,7 @@ const serviceTiers = new Set([
 const messageWords = new Set([
 	...[...safeWords].map((word) => word.toLowerCase()),
 	...serviceTiers,
-	..."invalid unsupported supported allowed disallowed forbidden permitted denied unavailable available required requires expected valid value values argument parameter field tier tiers account project plan must should can cannot is are was were be not only one of and or for with this the a an to on in set provided received does do support supports accept accepts accepted rejected enabled disabled".split(
+	..."invalid unsupported supported allowed disallowed forbidden permitted denied unavailable available required requires expected valid value values argument parameter field tier tiers account project plan must should can cannot is are was were be not only one of and or for with this the a an to on in set provided received does do support supports accept accepts accepted rejected enabled disabled tool tools namespaces".split(
 		" ",
 	),
 ])
@@ -330,8 +336,12 @@ export const createResponsesDiagnostics = (
 						status: response.status,
 						durationMs: Date.now() - started,
 						request: requestBody
-							? { serviceTier: summarizeServiceTier(requestBody) }
+							? {
+									serviceTier: summarizeServiceTier(requestBody),
+									tools: summarizeRequestTools(requestBody),
+								}
 							: undefined,
+						upstreamRequest: upstreamRequestSummary(),
 						rejection: response.ok ? undefined : await readSummary(response),
 					}),
 				)

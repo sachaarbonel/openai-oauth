@@ -19,6 +19,10 @@ import { createModelResolver } from "./models.js"
 import { handleResponsesRequest } from "./responses.js"
 import { createResponsesDiagnostics } from "./responses-diagnostics.js"
 import {
+	observeResponsesFetch,
+	withResponsesRequestDiagnostics,
+} from "./responses-request-diagnostics.js"
+import {
 	DEFAULT_HOST,
 	DEFAULT_PORT,
 	resolveAddress,
@@ -70,7 +74,10 @@ const handleRoutes = async (
 	}
 
 	if (request.method === "POST" && url.pathname === "/v1/responses") {
-		return handleResponsesRequest(request, client, responsesDiagnostics())
+		const diagnostic = responsesDiagnostics()
+		return withResponsesRequestDiagnostics(Boolean(diagnostic), () =>
+			handleResponsesRequest(request, client, diagnostic),
+		)
 	}
 
 	if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
@@ -92,6 +99,7 @@ const createOpenAIOAuthRuntime = (settings: OpenAIOAuthServerOptions = {}) => {
 	const auth = openaiCredentials(settings)
 	const sharedSettings = {
 		...settings,
+		fetch: observeResponsesFetch(settings.fetch ?? globalThis.fetch),
 		auth: () => auth.getSession(),
 		responsesState: false as const,
 	}
