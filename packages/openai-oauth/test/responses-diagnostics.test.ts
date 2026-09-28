@@ -15,6 +15,66 @@ import {
 } from "../src/responses-request-diagnostics.js"
 
 describe("bounded Responses diagnostics", () => {
+	test("returns the logged proxy ID without consuming or buffering the stream", async () => {
+		const write = vi.fn()
+		const cancel = vi.fn()
+		const bytes = new TextEncoder().encode("data: private fixture\n\n")
+		const diagnostic = createResponsesDiagnostics(true, write)()
+		if (!diagnostic) throw new Error("Expected diagnostics")
+		const response = await diagnostic(
+			"upstream_response",
+			new Response(
+				new ReadableStream(
+					{
+						start(controller) {
+							controller.enqueue(bytes)
+						},
+						cancel,
+					},
+					{ highWaterMark: 0 },
+				),
+				{
+					headers: {
+						"content-type": "text/event-stream",
+						"cache-control": "no-cache",
+					},
+				},
+			),
+		)
+		expect(response.headers.get("x-request-id")).toBe(
+			JSON.parse(write.mock.calls[0][0]).requestId,
+		)
+		expect(response.headers.get("cache-control")).toBe("no-cache")
+		if (!response.body) throw new Error("Expected stream")
+		const reader = response.body.getReader()
+		expect((await reader.read()).value).toEqual(bytes)
+		await reader.cancel()
+		expect(cancel).toHaveBeenCalledTimes(1)
+		expect(JSON.stringify(write.mock.calls)).not.toContain("private fixture")
+	})
+
+	test("returns unique IDs for JSON and budget-exhausted responses", async () => {
+		const write = vi.fn()
+		const create = createResponsesDiagnostics(true, write)
+		const ids = new Set<string>()
+		for (let i = 0; i < 10; i++) {
+			const diagnostic = create()
+			if (!diagnostic) throw new Error("Expected diagnostics")
+			const response = await diagnostic(
+				"proxy_validation",
+				Response.json({ error: "fixture" }, { status: 400 }),
+			)
+			expect(response.status).toBe(400)
+			expect(await response.json()).toEqual({ error: "fixture" })
+			const id = response.headers.get("x-request-id")
+			if (!id) throw new Error("Expected request ID")
+			expect(id).toMatch(/^[a-f0-9-]{36}$/)
+			ids.add(id)
+		}
+		expect(ids.size).toBe(10)
+		expect(createResponsesDiagnostics(false, write)()).toBeUndefined()
+	})
+
 	test("records the actual Lite tool split and preserves one unsupported-tools rejection", async () => {
 		const write = vi.fn()
 		const upstream = vi.fn(

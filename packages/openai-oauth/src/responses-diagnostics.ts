@@ -345,6 +345,10 @@ export const createResponsesDiagnostics = (
 				response: Response,
 				requestBody?: Record<string, unknown>,
 			) => {
+				// This identifies the proxy request, not an upstream provider request.
+				// Keep it available even when the diagnostic detail budget is exhausted.
+				// Responses passed here are constructed locally by the handler.
+				response.headers.set("x-request-id", requestId)
 				const category = response.ok ? "success" : "rejection"
 				const budget = budgets[category]
 				const timestamp = now()
