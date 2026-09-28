@@ -14,22 +14,22 @@ describe("Responses stream diagnostics", () => {
 	test("bounds lifecycle records and discards traces that were not selected", () => {
 		const write = vi.fn()
 		const trace = createResponsesLifecycleTrace("fixture-id", write)
-		for (let count = 0; count < 40; count++)
+		for (let count = 0; count < 60; count++)
 			trace.record("upstream_first_byte", { bytes: count })
 		expect(write).not.toHaveBeenCalled()
 		trace.activate()
-		expect(write).toHaveBeenCalledTimes(25)
+		expect(write).toHaveBeenCalledTimes(49)
 		expect(JSON.parse(write.mock.calls.at(-1)?.[0])).toMatchObject({
 			requestId: "fixture-id",
 			event: "event_limit",
 		})
 		trace.record("upstream_body_end")
-		expect(write).toHaveBeenCalledTimes(25)
+		expect(write).toHaveBeenCalledTimes(49)
 		const discarded = createResponsesLifecycleTrace("discarded-id", write)
 		discarded.record("upstream_headers")
 		discarded.discard()
 		discarded.activate()
-		expect(write).toHaveBeenCalledTimes(25)
+		expect(write).toHaveBeenCalledTimes(49)
 	})
 
 	test("records terminal type and bounded metadata without logging content or custom names", async () => {

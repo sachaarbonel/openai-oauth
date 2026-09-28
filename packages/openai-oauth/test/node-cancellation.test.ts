@@ -284,6 +284,7 @@ describe("Node HTTP cancellation", () => {
 				(line) => line.source === "openai-oauth-responses-lifecycle-diagnostic",
 			)
 		expect(lifecycle.map((line) => line.event)).toEqual([
+			"upstream_fetch_start",
 			"upstream_headers",
 			"upstream_first_byte",
 			"upstream_body_end",

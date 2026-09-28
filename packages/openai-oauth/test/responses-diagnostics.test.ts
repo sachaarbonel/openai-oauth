@@ -302,6 +302,7 @@ describe("bounded Responses diagnostics", () => {
 					entry.requestId === header.requestId,
 			)
 			expect(lifecycle.map((entry) => entry.event)).toEqual([
+				"upstream_fetch_start",
 				"upstream_headers",
 				"upstream_first_byte",
 				"upstream_body_end",
@@ -310,6 +311,252 @@ describe("bounded Responses diagnostics", () => {
 			expect(lifecycle.every((entry) => entry.upstreamCall === 1)).toBe(true)
 		}
 		expect(JSON.stringify(entries)).not.toContain("PRIVATE_PROMPT")
+	})
+
+	test.each([
+		undefined,
+		"application/x-fixture-stream",
+	])("observes upstream bytes without relying on content-type %s", async (contentType) => {
+		const write = vi.fn()
+		const diagnostic = createResponsesDiagnostics(true, write)()
+		if (!diagnostic) throw new Error("Missing fixture diagnostic")
+		const bytes = new TextEncoder().encode("PRIVATE_UPSTREAM_BYTES")
+		const pull = vi.fn()
+		const response = await withResponsesRequestDiagnostics(diagnostic, () =>
+			observeResponsesFetch(
+				async () =>
+					new Response(
+						new ReadableStream<Uint8Array>(
+							{
+								pull(controller) {
+									pull()
+									controller.enqueue(bytes)
+									controller.close()
+								},
+							},
+							{ highWaterMark: 0 },
+						),
+						{
+							headers: contentType
+								? { "content-type": contentType }
+								: undefined,
+						},
+					),
+			)("https://fixture.invalid/responses", {
+				method: "POST",
+				body: JSON.stringify({ stream: true, input: "PRIVATE_PROMPT" }),
+			}),
+		)
+		await diagnostic("upstream_response", response)
+		expect(pull).not.toHaveBeenCalled()
+		expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes)
+		const entries = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+		expect(
+			entries
+				.filter((entry) => entry.source.endsWith("lifecycle-diagnostic"))
+				.map((entry) => entry.event),
+		).toEqual([
+			"upstream_fetch_start",
+			"upstream_headers",
+			"upstream_first_byte",
+			"upstream_body_end",
+			"upstream_reader_released",
+		])
+		expect(JSON.stringify(entries)).not.toContain("PRIVATE")
+	})
+
+	test("records a pending later fetch before its headers", async () => {
+		const write = vi.fn()
+		const diagnostic = createResponsesDiagnostics(true, write)()
+		if (!diagnostic) throw new Error("Missing fixture diagnostic")
+		let resolveSecond: (response: Response) => void = () => {}
+		const second = new Promise<Response>((resolve) => {
+			resolveSecond = resolve
+		})
+		let calls = 0
+		const fetch = observeResponsesFetch(async () =>
+			++calls === 1 ? new Response(null) : second,
+		)
+		await withResponsesRequestDiagnostics(diagnostic, async () => {
+			const first = await fetch("https://fixture.invalid/responses")
+			await diagnostic("upstream_response", first)
+			expect(
+				write.mock.calls
+					.map(([line]) => JSON.parse(String(line)))
+					.find((entry) => entry.event === "upstream_probe_skipped"),
+			).toMatchObject({ reason: "no_body", upstreamCall: 1 })
+			const pending = fetch("https://fixture.invalid/responses")
+			const events = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+			expect(events.at(-1)).toMatchObject({
+				event: "upstream_fetch_start",
+				upstreamCall: 2,
+				target: "responses",
+			})
+			expect(
+				events.some(
+					(entry) =>
+						entry.upstreamCall === 2 && entry.event === "upstream_headers",
+				),
+			).toBe(false)
+			resolveSecond(new Response(null))
+			await pending
+		})
+	})
+
+	test("records last upstream byte before downstream cancellation of a stalled body", async () => {
+		const write = vi.fn()
+		const diagnostic = createResponsesDiagnostics(true, write)()
+		if (!diagnostic) throw new Error("Missing fixture diagnostic")
+		const abort = new AbortController()
+		const cancel = vi.fn()
+		const bytes = new TextEncoder().encode("PRIVATE_CHUNK")
+		const response = await withResponsesRequestDiagnostics(diagnostic, () =>
+			observeResponsesFetch(
+				async () =>
+					new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								controller.enqueue(bytes)
+							},
+							cancel,
+						}),
+					),
+			)("https://fixture.invalid/responses", { signal: abort.signal }),
+		)
+		await diagnostic("upstream_response", response)
+		const reader = response.body?.getReader()
+		if (!reader) throw new Error("Missing fixture body")
+		expect((await reader.read()).value).toEqual(bytes)
+		abort.abort()
+		await reader.cancel()
+		expect(cancel).toHaveBeenCalledTimes(1)
+		const entries = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+		const lifecycle = entries.filter((entry) =>
+			entry.source.endsWith("lifecycle-diagnostic"),
+		)
+		expect(lifecycle.map((entry) => entry.event)).toEqual([
+			"upstream_fetch_start",
+			"upstream_headers",
+			"upstream_first_byte",
+			"upstream_body_cancel",
+			"upstream_reader_released",
+		])
+		expect(lifecycle[3]).toMatchObject({
+			bytes: bytes.length,
+			signalAborted: true,
+			lastByteAt: expect.any(String),
+		})
+		expect(JSON.stringify(entries)).not.toContain("PRIVATE")
+	})
+
+	test("preserves upstream body errors and records only their safe name", async () => {
+		const write = vi.fn()
+		const diagnostic = createResponsesDiagnostics(true, write)()
+		if (!diagnostic) throw new Error("Missing fixture diagnostic")
+		const failure = new TypeError("PRIVATE_FAILURE")
+		let source: ReadableStreamDefaultController<Uint8Array> | undefined
+		const response = await withResponsesRequestDiagnostics(diagnostic, () =>
+			observeResponsesFetch(
+				async () =>
+					new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								source = controller
+								controller.enqueue(new Uint8Array([1, 2]))
+							},
+						}),
+					),
+			)("https://fixture.invalid/responses"),
+		)
+		await diagnostic("upstream_response", response)
+		const reader = response.body?.getReader()
+		if (!reader || !source) throw new Error("Missing fixture stream")
+		expect((await reader.read()).value).toEqual(new Uint8Array([1, 2]))
+		source.error(failure)
+		await expect(reader.read()).rejects.toBe(failure)
+		const entries = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+		expect(
+			entries.find((entry) => entry.event === "upstream_body_error"),
+		).toMatchObject({
+			errorName: "TypeError",
+			bytes: 2,
+			lastByteAt: expect.any(String),
+		})
+		expect(JSON.stringify(entries)).not.toContain("PRIVATE")
+	})
+
+	test("explains a failed-response probe skip without consuming the body", async () => {
+		const write = vi.fn()
+		const diagnostic = createResponsesDiagnostics(true, write)()
+		if (!diagnostic) throw new Error("Missing fixture diagnostic")
+		const failed = await withResponsesRequestDiagnostics(diagnostic, () =>
+			observeResponsesFetch(async () =>
+				Response.json({ secret: "PRIVATE" }, { status: 400 }),
+			)("https://fixture.invalid/responses"),
+		)
+		await diagnostic("upstream_response", failed)
+		expect(await failed.json()).toEqual({ secret: "PRIVATE" })
+		const events = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+		expect(
+			events.find((entry) => entry.event === "upstream_probe_skipped"),
+		).toMatchObject({
+			reason: "non_success",
+		})
+		expect(JSON.stringify(events)).not.toContain("PRIVATE")
+	})
+
+	test("reports a locked-body probe as unavailable and returns the original body", async () => {
+		const write = vi.fn()
+		const diagnostic = createResponsesDiagnostics(true, write)()
+		if (!diagnostic) throw new Error("Missing fixture diagnostic")
+		const upstream = new Response("PRIVATE_BODY", {
+			headers: { "content-type": "application/x-fixture-stream" },
+		})
+		const lock = upstream.body?.getReader()
+		if (!lock) throw new Error("Missing fixture body")
+		const response = await withResponsesRequestDiagnostics(diagnostic, () =>
+			observeResponsesFetch(async () => upstream)(
+				"https://fixture.invalid/responses",
+			),
+		)
+		await diagnostic("upstream_response", response)
+		expect(response).toBe(upstream)
+		expect(
+			write.mock.calls
+				.map(([line]) => JSON.parse(String(line)))
+				.find((entry) => entry.event === "upstream_probe_skipped"),
+		).toMatchObject({ reason: "probe_unavailable", errorName: "TypeError" })
+		lock.releaseLock()
+		expect(await response.text()).toBe("PRIVATE_BODY")
+		expect(JSON.stringify(write.mock.calls)).not.toContain("PRIVATE")
+	})
+
+	test("records fetch failure before headers without logging its message", async () => {
+		const write = vi.fn()
+		const diagnostic = createResponsesDiagnostics(true, write)()
+		if (!diagnostic) throw new Error("Missing fixture diagnostic")
+		const failure = new TypeError("PRIVATE_FETCH_FAILURE")
+		await withResponsesRequestDiagnostics(diagnostic, async () => {
+			await expect(
+				observeResponsesFetch(async () => {
+					throw failure
+				})("https://fixture.invalid/responses"),
+			).rejects.toBe(failure)
+			await diagnostic("transport_or_auth", new Response(null, { status: 500 }))
+		})
+		const entries = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+		expect(
+			entries
+				.filter((entry) => entry.source.endsWith("lifecycle-diagnostic"))
+				.map((entry) => entry.event),
+		).toEqual(["upstream_fetch_start", "upstream_fetch_error"])
+		expect(
+			entries.find((entry) => entry.event === "upstream_fetch_error"),
+		).toMatchObject({
+			errorName: "TypeError",
+			signalAborted: false,
+		})
+		expect(JSON.stringify(entries)).not.toContain("PRIVATE")
 	})
 
 	test("marks oversized or unreadable request capture unavailable without changing transport", async () => {

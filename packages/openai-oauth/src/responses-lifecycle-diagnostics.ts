@@ -1,6 +1,8 @@
 type Event =
+	| "upstream_fetch_start"
 	| "upstream_headers"
 	| "upstream_fetch_error"
+	| "upstream_probe_skipped"
 	| "upstream_first_byte"
 	| "upstream_body_end"
 	| "upstream_body_error"
@@ -22,9 +24,12 @@ type Details = {
 	lastByteAt?: string
 	bytes?: number
 	signalAborted?: boolean
+	reason?: "non_success" | "no_body" | "probe_unavailable"
 }
 
-const maxEvents = 24
+// Three model calls and two searches can each emit five lifecycle events;
+// retain enough room for the final downstream close and cleanup.
+const maxEvents = 48
 const safeErrorNames = new Set([
 	"AbortError",
 	"Error",

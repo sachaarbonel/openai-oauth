@@ -218,6 +218,13 @@ export const observeResponsesFetch =
 		if (!target || !current?.trace) return transport(input, init)
 		const trace = current.trace
 		const upstreamCall = trace.nextUpstreamCall()
+		const signal =
+			init?.signal ?? (input instanceof Request ? input.signal : undefined)
+		trace.record("upstream_fetch_start", {
+			upstreamCall,
+			target,
+			signalAborted: signal?.aborted ?? false,
+		})
 		let response: Response
 		try {
 			response = await transport(input, init)
@@ -226,7 +233,7 @@ export const observeResponsesFetch =
 				upstreamCall,
 				target,
 				errorName: safeStreamErrorName(error),
-				signalAborted: init?.signal?.aborted ?? false,
+				signalAborted: signal?.aborted ?? false,
 			})
 			throw error
 		}
@@ -234,27 +241,25 @@ export const observeResponsesFetch =
 			upstreamCall,
 			target,
 			status: response.status,
-			signalAborted: init?.signal?.aborted ?? false,
+			signalAborted: signal?.aborted ?? false,
 		})
-		if (
-			!response.ok ||
-			!response.body ||
-			(target === "responses" &&
-				!response.headers
-					.get("content-type")
-					?.toLowerCase()
-					.includes("text/event-stream"))
-		)
-			return response
-		try {
-			return observeUpstreamBody(
-				response,
-				trace,
+		if (!response.ok || !response.body) {
+			trace.record("upstream_probe_skipped", {
 				upstreamCall,
 				target,
-				init?.signal,
-			)
-		} catch {
+				reason: response.ok ? "no_body" : "non_success",
+			})
+			return response
+		}
+		try {
+			return observeUpstreamBody(response, trace, upstreamCall, target, signal)
+		} catch (error) {
+			trace.record("upstream_probe_skipped", {
+				upstreamCall,
+				target,
+				reason: "probe_unavailable",
+				errorName: safeStreamErrorName(error),
+			})
 			return response
 		}
 	}

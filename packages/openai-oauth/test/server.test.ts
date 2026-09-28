@@ -66,8 +66,11 @@ describe("openai oauth server", () => {
 				}),
 			)
 			expect(response.status).toBe(400)
-			expect(log).toHaveBeenCalledTimes(1)
-			expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
+			const entries = log.mock.calls.map(([line]) => JSON.parse(String(line)))
+			const summary = entries.find(
+				(entry) => entry.source === "openai-oauth-responses-diagnostic",
+			)
+			expect(summary).toMatchObject({
 				upstreamRequest: {
 					responsesLite: true,
 					capture: "captured",
@@ -77,7 +80,16 @@ describe("openai oauth server", () => {
 					},
 				},
 			})
-			expect(log.mock.calls[0][0]).not.toContain("PRIVATE")
+			expect(
+				entries
+					.filter((entry) => entry.source.endsWith("lifecycle-diagnostic"))
+					.map((entry) => entry.event),
+			).toEqual([
+				"upstream_fetch_start",
+				"upstream_headers",
+				"upstream_probe_skipped",
+			])
+			expect(JSON.stringify(entries)).not.toContain("PRIVATE")
 		} finally {
 			vi.unstubAllEnvs()
 			await fs.rm(path.dirname(authFilePath), { recursive: true, force: true })

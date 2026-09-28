@@ -401,15 +401,9 @@ export const createResponsesDiagnostics = (
 				} catch {
 					/* Diagnostics must not affect the request. */
 				}
-				if (
-					stage === "upstream_response" &&
-					response.ok &&
-					response.body &&
-					response.headers
-						.get("content-type")
-						?.toLowerCase()
-						.includes("text/event-stream")
-				)
+				// Upstream lifecycle evidence matters even when the body MIME type is
+				// absent, unexpected, or the fetch failed before a stream was returned.
+				if (stage === "upstream_response" || stage === "transport_or_auth")
 					trace.activate()
 				else trace.discard()
 				return stage === "upstream_response"
