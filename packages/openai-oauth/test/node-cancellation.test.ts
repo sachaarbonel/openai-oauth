@@ -180,15 +180,26 @@ describe("Node HTTP cancellation", () => {
 			expect(fixture.body.locked).toBe(false)
 		})
 		await vi.waitFor(() => {
-			const streamLog = logs.mock.calls
-				.map(([line]) => JSON.parse(String(line)))
-				.find(
-					(line) => line.source === "openai-oauth-responses-stream-diagnostic",
-				)
+			const entries = logs.mock.calls.map(([line]) => JSON.parse(String(line)))
+			const streamLog = entries.find(
+				(line) => line.source === "openai-oauth-responses-stream-diagnostic",
+			)
 			expect(streamLog).toMatchObject({
 				outcome: "client_closed",
 				terminal: "not_observed",
 			})
+			const lifecycle = entries
+				.filter(
+					(line) =>
+						line.source === "openai-oauth-responses-lifecycle-diagnostic",
+				)
+				.map((line) => line.event)
+			expect(lifecycle).toContain("downstream_close")
+			expect(lifecycle).toContain("upstream_body_cancel")
+			expect(lifecycle.indexOf("downstream_close")).toBeLessThan(
+				lifecycle.indexOf("upstream_body_cancel"),
+			)
+			expect(JSON.stringify(entries)).not.toContain("inert-offline-fixture")
 		})
 	})
 
@@ -259,8 +270,73 @@ describe("Node HTTP cancellation", () => {
 			requestId: headerLog.requestId,
 			outcome: "forwarded",
 			terminal: "response.completed",
+			firstEventType: "response.completed",
+			lastEventType: "response.completed",
+			firstEventAt: expect.any(String),
+			lastEventAt: expect.any(String),
+			terminalAt: expect.any(String),
 			itemTypes: [],
 			toolNames: [],
+		})
+		const lifecycle = logs.mock.calls
+			.map(([line]) => JSON.parse(String(line)))
+			.filter(
+				(line) => line.source === "openai-oauth-responses-lifecycle-diagnostic",
+			)
+		expect(lifecycle.map((line) => line.event)).toEqual([
+			"upstream_headers",
+			"upstream_first_byte",
+			"upstream_body_end",
+			"upstream_reader_released",
+			"writer_cleanup",
+			"downstream_finish",
+		])
+		expect(
+			lifecycle.every((line) => line.requestId === headerLog.requestId),
+		).toBe(true)
+	})
+
+	test("records upstream EOF before forwarding fails without a terminal SSE", async () => {
+		vi.stubEnv("CODEX_OPENAI_RESPONSES_DIAGNOSTICS", "1")
+		const logs = vi.spyOn(console, "log").mockImplementation(() => {})
+		const { received, closed } = await connect(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(
+								Buffer.from(
+									"event: response.output_item.done\\ndata: {}\\n\\n",
+								),
+							)
+							controller.close()
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
+				),
+		)
+		const response = await bounded(received.promise)
+		await bounded(
+			new Promise<void>((resolve) => response.resume().once("end", resolve)),
+		)
+		await bounded(closed.promise)
+		const entries = logs.mock.calls.map(([line]) => JSON.parse(String(line)))
+		const lifecycle = entries
+			.filter(
+				(line) => line.source === "openai-oauth-responses-lifecycle-diagnostic",
+			)
+			.map((line) => line.event)
+		expect(lifecycle).toContain("upstream_body_end")
+		expect(lifecycle.indexOf("upstream_body_end")).toBeLessThan(
+			lifecycle.indexOf("forward_error"),
+		)
+		expect(
+			entries.find(
+				(line) => line.source === "openai-oauth-responses-stream-diagnostic",
+			),
+		).toMatchObject({
+			outcome: "forward_error",
+			terminal: "not_observed",
 		})
 	})
 
@@ -284,17 +360,26 @@ describe("Node HTTP cancellation", () => {
 		await bounded(started.promise)
 		await bounded(received.promise).catch(() => undefined)
 		await vi.waitFor(() => {
-			const streamLog = logs.mock.calls
-				.map(([line]) => JSON.parse(String(line)))
-				.find(
-					(line) => line.source === "openai-oauth-responses-stream-diagnostic",
-				)
+			const entries = logs.mock.calls.map(([line]) => JSON.parse(String(line)))
+			const streamLog = entries.find(
+				(line) => line.source === "openai-oauth-responses-stream-diagnostic",
+			)
 			expect(streamLog).toMatchObject({
 				outcome: "forward_error",
 				terminal: "not_observed",
 				errorName: "Error",
 			})
 			expect(JSON.stringify(streamLog)).not.toContain("PRIVATE")
+			const lifecycle = entries
+				.filter(
+					(line) =>
+						line.source === "openai-oauth-responses-lifecycle-diagnostic",
+				)
+				.map((line) => line.event)
+			expect(lifecycle.indexOf("upstream_body_error")).toBeLessThan(
+				lifecycle.indexOf("forward_error"),
+			)
+			expect(JSON.stringify(entries)).not.toContain("PRIVATE_CREDENTIAL")
 		})
 	})
 })

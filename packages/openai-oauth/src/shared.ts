@@ -191,6 +191,7 @@ export const writeWebResponse = async (
 	webResponse: Response,
 	signal: AbortSignal,
 	onChunk?: (value: Uint8Array) => void,
+	onCleanup?: () => void,
 ): Promise<void> => {
 	if (signal.aborted || response.destroyed) {
 		void webResponse.body?.cancel(signal.reason).catch(() => {})
@@ -231,6 +232,7 @@ export const writeWebResponse = async (
 		signal.removeEventListener("abort", cancel)
 		if (!completed) cancel()
 		reader.releaseLock()
+		onCleanup?.()
 	}
 
 	if (!signal.aborted && !response.destroyed) response.end()

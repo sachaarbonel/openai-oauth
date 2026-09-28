@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest"
+import { createResponsesLifecycleTrace } from "../src/responses-lifecycle-diagnostics.js"
 import {
 	getResponsesStreamObserver,
 	observeResponsesStream,
@@ -10,24 +11,47 @@ const response = () =>
 	})
 
 describe("Responses stream diagnostics", () => {
+	test("bounds lifecycle records and discards traces that were not selected", () => {
+		const write = vi.fn()
+		const trace = createResponsesLifecycleTrace("fixture-id", write)
+		for (let count = 0; count < 40; count++)
+			trace.record("upstream_first_byte", { bytes: count })
+		expect(write).not.toHaveBeenCalled()
+		trace.activate()
+		expect(write).toHaveBeenCalledTimes(25)
+		expect(JSON.parse(write.mock.calls.at(-1)?.[0])).toMatchObject({
+			requestId: "fixture-id",
+			event: "event_limit",
+		})
+		trace.record("upstream_body_end")
+		expect(write).toHaveBeenCalledTimes(25)
+		const discarded = createResponsesLifecycleTrace("discarded-id", write)
+		discarded.record("upstream_headers")
+		discarded.discard()
+		discarded.activate()
+		expect(write).toHaveBeenCalledTimes(25)
+	})
+
 	test("records terminal type and bounded metadata without logging content or custom names", async () => {
 		const write = vi.fn()
 		const upstream = response()
 		expect(observeResponsesStream(upstream, "fixture-id", write)).toBe(upstream)
 		const observer = getResponsesStreamObserver(upstream)
-		const event = `event: response.completed\ndata: ${JSON.stringify({
-			response: {
-				output: [
-					{ type: "message", content: "PRIVATE_PROMPT" },
-					{
-						type: "function_call",
-						name: "PRIVATE_TOOL",
-						arguments: "PRIVATE_ARGS",
-					},
-					{ type: "apply_patch_call", name: "apply_patch" },
-				],
+		const event = `event: PRIVATE_EVENT\ndata: PRIVATE_EVENT_BODY\n\nevent: response.completed\ndata: ${JSON.stringify(
+			{
+				response: {
+					output: [
+						{ type: "message", content: "PRIVATE_PROMPT" },
+						{
+							type: "function_call",
+							name: "PRIVATE_TOOL",
+							arguments: "PRIVATE_ARGS",
+						},
+						{ type: "apply_patch_call", name: "apply_patch" },
+					],
+				},
 			},
-		})}\n\n`
+		)}\n\n`
 		const bytes = new TextEncoder().encode(event)
 		observer?.chunk(bytes.subarray(0, 17))
 		observer?.chunk(bytes.subarray(17))
@@ -43,6 +67,11 @@ describe("Responses stream diagnostics", () => {
 			toolNames: ["apply_patch"],
 			withheldToolNames: 1,
 			outputSummary: "captured",
+			firstEventType: "other",
+			lastEventType: "response.completed",
+			firstEventAt: expect.any(String),
+			lastEventAt: expect.any(String),
+			terminalAt: expect.any(String),
 		})
 		expect(line).not.toMatch(/PRIVATE/)
 		expect(upstream.bodyUsed).toBe(false)

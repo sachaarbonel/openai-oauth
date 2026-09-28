@@ -1,3 +1,7 @@
+import {
+	type ResponsesLifecycleTrace,
+	safeStreamErrorName,
+} from "./responses-lifecycle-diagnostics.js"
 import { isRecord } from "./shared.js"
 
 type StreamOutcome = "forwarded" | "client_closed" | "forward_error"
@@ -37,9 +41,37 @@ const terminalEvents = new Set<Terminal>([
 	"response.incomplete",
 	"error",
 ])
+const knownEventTypes = new Set([
+	"response.created",
+	"response.in_progress",
+	"response.output_item.added",
+	"response.output_item.done",
+	"response.output_text.delta",
+	"response.output_text.done",
+	"response.reasoning_summary_text.delta",
+	"response.reasoning_summary_text.done",
+	"response.function_call_arguments.delta",
+	"response.function_call_arguments.done",
+	"response.web_search_call.searching",
+	"response.web_search_call.completed",
+	"response.web_search_call.in_progress",
+	"response.completed",
+	"response.failed",
+	"response.incomplete",
+	"error",
+])
 
 export type ResponsesStreamObserver = {
 	chunk(value: Uint8Array): void
+	mark(
+		event:
+			| "downstream_close"
+			| "proxy_abort"
+			| "writer_cleanup"
+			| "downstream_finish"
+			| "forward_error",
+		error?: unknown,
+	): void
 	finish(outcome: StreamOutcome, error?: unknown): void
 }
 
@@ -52,6 +84,7 @@ export const observeResponsesStream = (
 	response: Response,
 	requestId: string,
 	write: (line: string) => void,
+	trace?: ResponsesLifecycleTrace,
 ) => {
 	if (
 		!response.ok ||
@@ -75,6 +108,12 @@ export const observeResponsesStream = (
 	let toolNames: string[] | undefined
 	let withheldToolNames = 0
 	let outputSummary = "unavailable"
+	let firstEventAt: string | undefined
+	let firstEventType: string | undefined
+	let lastEventAt: string | undefined
+	let lastEventType: string | undefined
+	let terminalAt: string | undefined
+	let lastChunkAt: string | undefined
 
 	const inspect = (frame: string) => {
 		if (++eventCount > 10_000) {
@@ -82,8 +121,17 @@ export const observeResponsesStream = (
 			return
 		}
 		const event = /^event:\s*([^\r\n]+)/m.exec(frame)?.[1]
-		if (!event || !terminalEvents.has(event as Terminal)) return
+		if (!event) return
+		const observedAt = new Date().toISOString()
+		if (!firstEventAt) {
+			firstEventAt = observedAt
+			firstEventType = knownEventTypes.has(event) ? event : "other"
+		}
+		lastEventAt = observedAt
+		lastEventType = knownEventTypes.has(event) ? event : "other"
+		if (!terminalEvents.has(event as Terminal)) return
 		terminal = event as Terminal
+		terminalAt = observedAt
 		if (terminal !== "response.completed") return
 		const data = frame
 			.split(/\r?\n/)
@@ -118,6 +166,7 @@ export const observeResponsesStream = (
 
 	const observer: ResponsesStreamObserver = {
 		chunk(value) {
+			lastChunkAt = new Date().toISOString()
 			if (!inspecting) return
 			for (let offset = 0; offset < value.byteLength; offset += 8192) {
 				pending += decoder.decode(value.subarray(offset, offset + 8192), {
@@ -143,6 +192,13 @@ export const observeResponsesStream = (
 				} else if (droppingOversized) pending = pending.slice(-3)
 			}
 		},
+		mark(event, error) {
+			trace?.record(event, {
+				...(error === undefined
+					? {}
+					: { errorName: safeStreamErrorName(error) }),
+			})
+		},
 		finish(outcome, error) {
 			if (finished) return
 			finished = true
@@ -163,6 +219,12 @@ export const observeResponsesStream = (
 						requestId,
 						outcome,
 						terminal: terminal ?? "not_observed",
+						firstEventAt,
+						firstEventType,
+						lastEventAt,
+						lastEventType,
+						terminalAt,
+						lastChunkAt,
 						itemTypes,
 						toolNames,
 						withheldToolNames: withheldToolNames || undefined,

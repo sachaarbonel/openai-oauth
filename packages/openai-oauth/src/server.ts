@@ -76,7 +76,7 @@ const handleRoutes = async (
 
 	if (request.method === "POST" && url.pathname === "/v1/responses") {
 		const diagnostic = responsesDiagnostics()
-		return withResponsesRequestDiagnostics(Boolean(diagnostic), () =>
+		return withResponsesRequestDiagnostics(diagnostic, () =>
 			handleResponsesRequest(request, client, diagnostic),
 		)
 	}
@@ -153,12 +153,17 @@ export const startOpenAIOAuthServer = async (
 		let streamObserver: ReturnType<typeof getResponsesStreamObserver>
 		const abort = () => controller.abort()
 		req.once("aborted", abort)
-		res.once("finish", () => streamObserver?.finish("forwarded"))
+		res.once("finish", () => {
+			streamObserver?.mark("downstream_finish")
+			streamObserver?.finish("forwarded")
+		})
 		res.once("close", () => {
 			req.off("aborted", abort)
 			// IncomingMessage.close also fires after a normal POST body is read.
 			// Only an unfinished outgoing response indicates a disconnected client.
 			if (!res.writableFinished) {
+				streamObserver?.mark("downstream_close")
+				streamObserver?.mark("proxy_abort")
 				abort()
 				streamObserver?.finish("client_closed")
 			}
@@ -172,15 +177,22 @@ export const startOpenAIOAuthServer = async (
 			controller.signal.throwIfAborted()
 			const response = await handler(request)
 			streamObserver = getResponsesStreamObserver(response)
-			await writeWebResponse(res, response, controller.signal, (chunk) => {
-				try {
-					streamObserver?.chunk(chunk)
-				} catch {
-					/* Diagnostic inspection must not interrupt forwarding. */
-				}
-			})
+			await writeWebResponse(
+				res,
+				response,
+				controller.signal,
+				(chunk) => {
+					try {
+						streamObserver?.chunk(chunk)
+					} catch {
+						/* Diagnostic inspection must not interrupt forwarding. */
+					}
+				},
+				() => streamObserver?.mark("writer_cleanup"),
+			)
 			if (controller.signal.aborted) streamObserver?.finish("client_closed")
 		} catch (error) {
+			streamObserver?.mark("forward_error", error)
 			streamObserver?.finish(
 				controller.signal.aborted || res.destroyed
 					? "client_closed"

@@ -197,6 +197,61 @@ describe("bounded Responses diagnostics", () => {
 		expect(write).toHaveBeenCalledTimes(2)
 	})
 
+	test("keeps lifecycle events on the right request when streams overlap", async () => {
+		const write = vi.fn()
+		const begin = createResponsesDiagnostics(true, write)
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let arrived = 0
+		const observed = observeResponsesFetch(async () => {
+			if (++arrived === 2) release()
+			await gate
+			return new Response(
+				"event: response.completed\ndata: PRIVATE_PROMPT\n\n",
+				{ headers: { "content-type": "text/event-stream" } },
+			)
+		})
+		await Promise.all(
+			["function", "web_search"].map(async (type) => {
+				const diagnostic = begin()
+				if (!diagnostic) throw new Error("Missing fixture diagnostic")
+				await withResponsesRequestDiagnostics(diagnostic, async () => {
+					const response = await observed("https://fixture.invalid/responses", {
+						method: "POST",
+						body: JSON.stringify({ tools: [{ type }] }),
+					})
+					await diagnostic("upstream_response", response, {
+						tools: [{ type }],
+					})
+					await response.text()
+				})
+			}),
+		)
+		const entries = write.mock.calls.map(([line]) => JSON.parse(String(line)))
+		const headers = entries.filter(
+			(entry) => entry.source === "openai-oauth-responses-diagnostic",
+		)
+		expect(headers).toHaveLength(2)
+		expect(headers[0].requestId).not.toBe(headers[1].requestId)
+		for (const header of headers) {
+			const lifecycle = entries.filter(
+				(entry) =>
+					entry.source === "openai-oauth-responses-lifecycle-diagnostic" &&
+					entry.requestId === header.requestId,
+			)
+			expect(lifecycle.map((entry) => entry.event)).toEqual([
+				"upstream_headers",
+				"upstream_first_byte",
+				"upstream_body_end",
+				"upstream_reader_released",
+			])
+			expect(lifecycle.every((entry) => entry.upstreamCall === 1)).toBe(true)
+		}
+		expect(JSON.stringify(entries)).not.toContain("PRIVATE_PROMPT")
+	})
+
 	test("marks oversized or unreadable request capture unavailable without changing transport", async () => {
 		for (const body of ["{", " ".repeat(1_048_577), new ReadableStream()]) {
 			const write = vi.fn()

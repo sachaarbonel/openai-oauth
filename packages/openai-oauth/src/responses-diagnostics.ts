@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto"
 import {
+	createResponsesLifecycleTrace,
+	type ResponsesLifecycleTrace,
+} from "./responses-lifecycle-diagnostics.js"
+import {
 	diagnosticToolTypes,
 	summarizeRequestTools,
 	upstreamRequestSummary,
@@ -8,11 +12,14 @@ import { observeResponsesStream } from "./responses-stream-diagnostics.js"
 import { isRecord } from "./shared.js"
 
 type Stage = "proxy_validation" | "upstream_response" | "transport_or_auth"
-export type ResponseDiagnostic = (
-	stage: Stage,
-	response: Response,
-	requestBody?: Record<string, unknown>,
-) => Promise<Response>
+export type ResponseDiagnostic = {
+	(
+		stage: Stage,
+		response: Response,
+		requestBody?: Record<string, unknown>,
+	): Promise<Response>
+	trace: ResponsesLifecycleTrace
+}
 
 const safeWords = new Set([
 	...diagnosticToolTypes,
@@ -317,7 +324,7 @@ const readSummary = async (response: Response) => {
 
 // Explicit opt-in; independent success/rejection budgets renew every minute.
 // Each rejection remains limited to 16 KiB/1s of inspection.
-// Stream metadata is observed only as the Node response writer forwards bytes.
+// Stream metadata is observed only as the proxy reads and forwards bytes.
 export const createResponsesDiagnostics = (
 	enabled = process.env.CODEX_OPENAI_RESPONSES_DIAGNOSTICS === "1",
 	write: (line: string) => void = (line) => console.log(line),
@@ -331,61 +338,81 @@ export const createResponsesDiagnostics = (
 		if (!enabled) return undefined
 		const requestId = randomUUID()
 		const started = Date.now()
-		return async (stage, response, requestBody) => {
-			const category = response.ok ? "success" : "rejection"
-			const budget = budgets[category]
-			const timestamp = now()
-			if (timestamp - budget.started >= 60_000) {
-				budget.started = timestamp
-				budget.used = 0
-			}
-			// Reserve before awaiting body inspection, including concurrent requests.
-			if (budget.used++ >= 8) {
-				if (budget.used === 9) {
-					try {
-						write(
-							JSON.stringify({
-								source: "openai-oauth-responses-diagnostic-limit",
-								timestamp: new Date(timestamp).toISOString(),
-								requestId,
-								category,
-								status: response.status,
-								reason:
-									"Eight diagnostics captured in this category; further details withheld until reset.",
-								resumesAt: new Date(budget.started + 60_000).toISOString(),
-							}),
-						)
-					} catch {
-						/* Diagnostics must not affect the request. */
-					}
+		const trace = createResponsesLifecycleTrace(requestId, write)
+		return Object.assign(
+			async (
+				stage: Stage,
+				response: Response,
+				requestBody?: Record<string, unknown>,
+			) => {
+				const category = response.ok ? "success" : "rejection"
+				const budget = budgets[category]
+				const timestamp = now()
+				if (timestamp - budget.started >= 60_000) {
+					budget.started = timestamp
+					budget.used = 0
 				}
-				return response
-			}
-			try {
-				write(
-					JSON.stringify({
-						source: "openai-oauth-responses-diagnostic",
-						timestamp: new Date().toISOString(),
-						requestId,
-						stage,
-						status: response.status,
-						durationMs: Date.now() - started,
-						request: requestBody
-							? {
-									serviceTier: summarizeServiceTier(requestBody),
-									tools: summarizeRequestTools(requestBody),
-								}
-							: undefined,
-						upstreamRequest: upstreamRequestSummary(),
-						rejection: response.ok ? undefined : await readSummary(response),
-					}),
+				// Reserve before awaiting body inspection, including concurrent requests.
+				if (budget.used++ >= 8) {
+					trace.discard()
+					if (budget.used === 9) {
+						try {
+							write(
+								JSON.stringify({
+									source: "openai-oauth-responses-diagnostic-limit",
+									timestamp: new Date(timestamp).toISOString(),
+									requestId,
+									category,
+									status: response.status,
+									reason:
+										"Eight diagnostics captured in this category; further details withheld until reset.",
+									resumesAt: new Date(budget.started + 60_000).toISOString(),
+								}),
+							)
+						} catch {
+							/* Diagnostics must not affect the request. */
+						}
+					}
+					return response
+				}
+				try {
+					write(
+						JSON.stringify({
+							source: "openai-oauth-responses-diagnostic",
+							timestamp: new Date().toISOString(),
+							requestId,
+							stage,
+							status: response.status,
+							durationMs: Date.now() - started,
+							request: requestBody
+								? {
+										serviceTier: summarizeServiceTier(requestBody),
+										tools: summarizeRequestTools(requestBody),
+									}
+								: undefined,
+							upstreamRequest: upstreamRequestSummary(),
+							rejection: response.ok ? undefined : await readSummary(response),
+						}),
+					)
+				} catch {
+					/* Diagnostics must not affect the request. */
+				}
+				if (
+					stage === "upstream_response" &&
+					response.ok &&
+					response.body &&
+					response.headers
+						.get("content-type")
+						?.toLowerCase()
+						.includes("text/event-stream")
 				)
-			} catch {
-				/* Diagnostics must not affect the request. */
-			}
-			return stage === "upstream_response"
-				? observeResponsesStream(response, requestId, write)
-				: response
-		}
+					trace.activate()
+				else trace.discard()
+				return stage === "upstream_response"
+					? observeResponsesStream(response, requestId, write, trace)
+					: response
+			},
+			{ trace },
+		)
 	}
 }
