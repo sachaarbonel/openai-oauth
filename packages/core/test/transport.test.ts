@@ -332,8 +332,14 @@ describe("createCodexOAuthFetch", () => {
 	test.each([
 		true,
 		false,
-	])("rejects native Lite parallel calls before upstream fetch (stream=%s)", async (stream) => {
-		const fetch = createMockFetch()
+	])("adapts native Lite parallel calls to a batch tool (stream=%s)", async (stream) => {
+		const fetch = createMockFetch(
+			async () =>
+				new Response(
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_parallel","status":"completed","output":[]}}\n\n',
+					{ headers: { "Content-Type": "text/event-stream" } },
+				),
+		)
 		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
 		const response = await oauthFetch("https://example.test/v1/responses", {
 			method: "POST",
@@ -346,15 +352,17 @@ describe("createCodexOAuthFetch", () => {
 				tools: [{ type: "function", name: "read_palette" }],
 			}),
 		})
-		expect(response.status).toBe(400)
-		await expect(response.json()).resolves.toMatchObject({
-			error: {
-				type: "invalid_request_error",
-				code: "unsupported_parallel_tool_calls",
-				param: "parallel_tool_calls",
-			},
-		})
-		expect(upstreamCalls(fetch)).toHaveLength(0)
+		expect(response.status).toBe(200)
+		await response.text()
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		const body = JSON.parse(String(init?.body))
+		expect(body.parallel_tool_calls).toBe(false)
+		expect(body.input[0].tools).toEqual([
+			expect.objectContaining({
+				type: "function",
+				name: "__openai_oauth_parallel",
+			}),
+		])
 	})
 
 	test("preserves native parallel calls for non-Lite models", async () => {
@@ -375,6 +383,53 @@ describe("createCodexOAuthFetch", () => {
 		expect(
 			new Headers(init?.headers).has("x-openai-internal-codex-responses-lite"),
 		).toBe(false)
+	})
+
+	test("rejects an unsupported Lite parallel mix without forwarding it upstream", async () => {
+		const fetch = createMockFetch()
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+		const response = await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-6.1-sol",
+				parallel_tool_calls: true,
+				tools: [{ type: "function", name: "read_palette" }],
+				input: [{ type: "additional_tools", role: "developer", tools: [] }],
+			}),
+		})
+		expect(response.status).toBe(400)
+		await expect(response.json()).resolves.toMatchObject({
+			error: {
+				code: "invalid_parallel_tool_bridge",
+				param: "parallel_tool_calls",
+			},
+		})
+		expect(upstreamCalls(fetch)).toHaveLength(0)
+	})
+
+	test("keeps apply_patch available alongside the parallel function bridge", async () => {
+		const fetch = createMockFetch()
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+		await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-6.1-sol",
+				stream: true,
+				parallel_tool_calls: true,
+				tools: [
+					{ type: "function", name: "read_palette" },
+					{ type: "apply_patch" },
+				],
+			}),
+		})
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		const body = JSON.parse(String(init?.body))
+		expect(body.parallel_tool_calls).toBe(false)
+		expect(
+			body.input[0].tools.map((tool: { name: string }) => tool.name),
+		).toEqual(["__openai_oauth_apply_patch", "__openai_oauth_parallel"])
 	})
 
 	test("keeps hosted web search in top-level tools for Responses Lite", async () => {

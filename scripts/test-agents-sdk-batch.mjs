@@ -1,5 +1,5 @@
-// Offline example of client-side parallelism for Responses Lite. SDK dependencies
-// are installed in the isolated directory passed as the first argument.
+// Offline SDK fixture for the proxy's Responses Lite parallel-tool bridge.
+// Dependencies stay in the isolated directory passed as the first argument.
 import assert from "node:assert/strict"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { createRequire } from "node:module"
@@ -96,118 +96,156 @@ const stream = (number, item) => {
 	)
 }
 
-test("one Lite batch tool executes independent client operations concurrently", async () => {
-	const root = await mkdtemp(join(tmpdir(), "openai-oauth-batch-fixture-"))
-	try {
-		const authFilePath = join(root, "auth.json")
-		await writeFile(
-			authFilePath,
-			JSON.stringify({
-				tokens: { access_token: "inert-fixture", account_id: "inert-fixture" },
-			}),
-			{ mode: 0o600 },
-		)
-		let requests = 0
-		const seen = []
-		let releaseBoth
-		const bothStarted = new Promise((resolve) => {
-			releaseBoth = resolve
-		})
-		const handler = createOpenAIOAuthFetchHandler({
-			authFilePath,
-			ensureFresh: false,
-			codexVersion: "0.144.1",
-			fetch: async (url, init) => {
-				const path = new URL(String(url)).pathname
-				if (path.endsWith("/models"))
-					return Response.json({
-						models: [{ slug: "gpt-6.1-sol", use_responses_lite: true }],
-					})
-				assert.equal(path, "/backend-api/codex/responses")
-				assert.ok(++requests <= 2)
-				const body = JSON.parse(init.body)
-				assert.equal(body.parallel_tool_calls, false)
-				if (requests === 1) {
-					assert.equal(body.tools, undefined)
-					assert.equal(body.input[0].type, "additional_tools")
-					assert.equal(body.input[0].tools[0].name, "batch_independent")
-					return stream(1, {
-						type: "function_call",
-						id: "fc_batch",
-						call_id: "call_batch",
-						name: "batch_independent",
-						status: "completed",
-						arguments: JSON.stringify({ names: ["palette", "layout"] }),
-					})
-				}
-				const result = body.input.find(
-					(item) =>
-						item.type === "function_call_output" &&
-						item.call_id === "call_batch",
-				)
-				assert.deepEqual(JSON.parse(result.output), [
-					{ name: "palette", value: "blue" },
-					{ name: "layout", value: "grid" },
-				])
-				return stream(2, {
-					type: "message",
-					id: "msg_batch",
-					role: "assistant",
-					status: "completed",
-					content: [
-						{ type: "output_text", text: "Both checked", annotations: [] },
-					],
-				})
-			},
-		})
-		const client = new OpenAI({
-			apiKey: "inert-fixture",
-			baseURL: "http://fixture.invalid/v1",
-			maxRetries: 0,
-			fetch: (url, init) => handler(new Request(url, init)),
-		})
-		const agent = new Agent({
-			name: "Batch fixture",
-			model: "gpt-6.1-sol",
-			modelSettings: { store: false, parallelToolCalls: false },
-			tools: [
-				tool({
-					name: "batch_independent",
-					description: "Read independent fixture values concurrently",
-					parameters: z.object({
-						names: z.array(z.enum(["palette", "layout"])),
-					}),
-					execute: async ({ names }) =>
-						JSON.stringify(
-							await Promise.all(
-								names.map(async (name) => {
-									seen.push(name)
-									if (seen.length === 2) releaseBoth()
-									await bothStarted
-									return { name, value: name === "palette" ? "blue" : "grid" }
-								}),
-							),
-						),
+for (const useStream of [true, false])
+	test(`Lite batch bridge exposes concurrent SDK calls (stream=${useStream})`, async () => {
+		const root = await mkdtemp(join(tmpdir(), "openai-oauth-batch-fixture-"))
+		try {
+			const authFilePath = join(root, "auth.json")
+			await writeFile(
+				authFilePath,
+				JSON.stringify({
+					tokens: {
+						access_token: "inert-fixture",
+						account_id: "inert-fixture",
+					},
 				}),
-			],
-		})
-		const runner = new Runner({
-			modelProvider: new OpenAIProvider({ openAIClient: client }),
-			tracingDisabled: true,
-		})
-		const result = await runner.run(agent, "Check both fixture values", {
-			stream: true,
-			maxTurns: 2,
-			signal: AbortSignal.timeout(5000),
-		})
-		for await (const _event of result) {
-			/* Consume the SDK stream. */
+				{ mode: 0o600 },
+			)
+			let requests = 0
+			const downstream = []
+			const seen = []
+			let releaseBoth
+			const bothStarted = new Promise((resolve) => {
+				releaseBoth = resolve
+			})
+			const handler = createOpenAIOAuthFetchHandler({
+				authFilePath,
+				ensureFresh: false,
+				codexVersion: "0.144.1",
+				fetch: async (url, init) => {
+					const path = new URL(String(url)).pathname
+					if (path.endsWith("/models"))
+						return Response.json({
+							models: [{ slug: "gpt-6.1-sol", use_responses_lite: true }],
+						})
+					assert.equal(path, "/backend-api/codex/responses")
+					assert.ok(++requests <= 2)
+					const body = JSON.parse(init.body)
+					assert.equal(body.parallel_tool_calls, false)
+					if (requests === 1) {
+						assert.equal(body.tools, undefined)
+						assert.equal(body.input[0].type, "additional_tools")
+						assert.equal(body.input[0].tools.length, 1)
+						assert.equal(body.input[0].tools[0].name, "__openai_oauth_parallel")
+						return stream(1, {
+							type: "function_call",
+							id: "fc_batch",
+							call_id: "call_batch",
+							name: "__openai_oauth_parallel",
+							status: "completed",
+							arguments: JSON.stringify({
+								calls: [
+									{ name: "read_palette", arguments: {} },
+									{ name: "read_layout", arguments: {} },
+								],
+							}),
+						})
+					}
+					const call = body.input.find(
+						(item) =>
+							item.type === "function_call" && item.call_id === "call_batch",
+					)
+					assert.equal(call.name, "__openai_oauth_parallel")
+					assert.deepEqual(JSON.parse(call.arguments).calls, [
+						{ name: "read_palette", arguments: {} },
+						{ name: "read_layout", arguments: {} },
+					])
+					const result = body.input.find(
+						(item) =>
+							item.type === "function_call_output" &&
+							item.call_id === "call_batch",
+					)
+					assert.deepEqual(JSON.parse(result.output).results, [
+						{ name: "read_palette", output: "blue", status: "completed" },
+						{ name: "read_layout", output: "grid", status: "completed" },
+					])
+					return stream(2, {
+						type: "message",
+						id: "msg_batch",
+						role: "assistant",
+						status: "completed",
+						content: [
+							{ type: "output_text", text: "Both checked", annotations: [] },
+						],
+					})
+				},
+			})
+			const client = new OpenAI({
+				apiKey: "inert-fixture",
+				baseURL: "http://fixture.invalid/v1",
+				maxRetries: 0,
+				fetch: (url, init) => {
+					downstream.push(JSON.parse(init.body))
+					return handler(new Request(url, init))
+				},
+			})
+			const agent = new Agent({
+				name: "Batch fixture",
+				model: "gpt-6.1-sol",
+				modelSettings: { store: false, parallelToolCalls: true },
+				tools: [
+					tool({
+						name: "read_palette",
+						description: "Read fixture palette",
+						parameters: z.object({}),
+						execute: async () => {
+							seen.push("palette")
+							if (seen.length === 2) releaseBoth()
+							await bothStarted
+							return "blue"
+						},
+					}),
+					tool({
+						name: "read_layout",
+						description: "Read fixture layout",
+						parameters: z.object({}),
+						execute: async () => {
+							seen.push("layout")
+							if (seen.length === 2) releaseBoth()
+							await bothStarted
+							return "grid"
+						},
+					}),
+				],
+			})
+			const runner = new Runner({
+				modelProvider: new OpenAIProvider({ openAIClient: client }),
+				tracingDisabled: true,
+			})
+			const result = await runner.run(agent, "Check both fixture values", {
+				stream: useStream,
+				maxTurns: 2,
+				signal: AbortSignal.timeout(5000),
+			})
+			if (useStream) {
+				for await (const _event of result) {
+					/* Consume the SDK stream. */
+				}
+				await result.completed
+			}
+			assert.equal(result.finalOutput, "Both checked")
+			assert.deepEqual(seen, ["palette", "layout"])
+			assert.equal(requests, 2)
+			assert.equal(downstream.length, 2)
+			assert.equal(downstream[0].parallel_tool_calls, true)
+			assert.equal(downstream[1].parallel_tool_calls, true)
+			assert.deepEqual(
+				downstream[1].input
+					.filter((item) => item.type === "function_call")
+					.map((item) => item.name),
+				["read_palette", "read_layout"],
+			)
+		} finally {
+			await rm(root, { recursive: true, force: true })
 		}
-		await result.completed
-		assert.equal(result.finalOutput, "Both checked")
-		assert.deepEqual(seen, ["palette", "layout"])
-		assert.equal(requests, 2)
-	} finally {
-		await rm(root, { recursive: true, force: true })
-	}
-})
+	})

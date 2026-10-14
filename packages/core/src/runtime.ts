@@ -10,6 +10,13 @@ import {
 	fetchCodexModelCatalog,
 	isPublicCodexModel,
 } from "./models.js"
+import {
+	adaptParallelInput,
+	adaptParallelResponsesSse,
+	PARALLEL_TOOL_FUNCTION,
+	ParallelToolBridgeError,
+	parallelToolDefinition,
+} from "./parallel-tool-bridge.js"
 import { standaloneSearchResponse } from "./search-bridge.js"
 import {
 	collectCompletedResponseFromSse,
@@ -648,13 +655,41 @@ const applyModelDefaults = (
 			}
 		}
 	}
+	const ordinaryFunctions = tools.filter(
+		(tool): tool is Record<string, unknown> =>
+			isRecord(tool) && tool.type === "function",
+	)
+	const parallelBridge =
+		normalized.parallel_tool_calls === true && ordinaryFunctions.length > 0
+	if (
+		parallelBridge &&
+		input.some((item) => isRecord(item) && item.type === "additional_tools")
+	)
+		throw new ParallelToolBridgeError(
+			"Parallel tool bridging cannot combine predeclared additional_tools.",
+		)
+	if (
+		parallelBridge &&
+		isRecord(normalized.tool_choice) &&
+		normalized.tool_choice.type === "function"
+	)
+		throw new ParallelToolBridgeError(
+			"Parallel tool bridging does not support a forced individual tool choice.",
+		)
 	const functionTools = tools.flatMap((tool) =>
 		isRecord(tool) && tool.type === "apply_patch"
 			? [applyPatchFunction(patchName)]
-			: isRecord(tool) && tool.type === "function"
+			: !parallelBridge && isRecord(tool) && tool.type === "function"
 				? [tool]
 				: [],
 	)
+	if (parallelBridge) {
+		if (ordinaryFunctions.some((tool) => tool.name === PARALLEL_TOOL_FUNCTION))
+			throw new ParallelToolBridgeError(
+				"Reserved parallel tool name is already declared.",
+			)
+		functionTools.push(parallelToolDefinition(ordinaryFunctions))
+	}
 	const hostedTools = tools.filter(
 		(tool) =>
 			!isRecord(tool) ||
@@ -725,6 +760,7 @@ type PreparedResponsesRequestBody = {
 	wantsStream?: boolean
 	useResponsesLite?: boolean
 	patchToolName?: string
+	parallelToolNames?: Set<string>
 }
 
 type ResolveModelInfo = (
@@ -775,23 +811,21 @@ const prepareResponsesRequestBody = async (
 			typeof parsed.model === "string"
 				? await resolveModelInfo(auth, parsed.model)
 				: undefined
-		if (modelInfo?.useResponsesLite && parsed.parallel_tool_calls === true) {
-			return {
-				body,
-				errorResponse: Response.json(
-					{
-						error: {
-							message:
-								"Responses Lite requires parallel_tool_calls=false. To run independent tools concurrently, expose one client-side batch tool and execute its operations in parallel.",
-							type: "invalid_request_error",
-							code: "unsupported_parallel_tool_calls",
-							param: "parallel_tool_calls",
-						},
-					},
-					{ status: 400 },
-				),
-			}
-		}
+		const parallelToolNames =
+			modelInfo?.useResponsesLite &&
+			parsed.parallel_tool_calls === true &&
+			Array.isArray(parsed.tools)
+				? new Set<string>(
+						parsed.tools
+							.filter(
+								(tool: unknown) =>
+									isRecord(tool) &&
+									tool.type === "function" &&
+									typeof tool.name === "string",
+							)
+							.map((tool: Record<string, unknown>) => tool.name as string),
+					)
+				: undefined
 
 		const normalized = normalizeCodexResponsesBodyInternal(parsed, {
 			forceStream: true,
@@ -807,6 +841,8 @@ const prepareResponsesRequestBody = async (
 		}
 
 		const expanded = state?.expandRequestBody(normalized) ?? normalized
+		if (parallelToolNames?.size && Array.isArray(expanded.input))
+			expanded.input = adaptParallelInput(expanded.input)
 
 		const patchToolName =
 			modelInfo?.useResponsesLite === true &&
@@ -825,8 +861,26 @@ const prepareResponsesRequestBody = async (
 			wantsStream,
 			useResponsesLite: modelInfo?.useResponsesLite === true,
 			patchToolName,
+			parallelToolNames: parallelToolNames?.size
+				? parallelToolNames
+				: undefined,
 		}
-	} catch {
+	} catch (error) {
+		if (error instanceof ParallelToolBridgeError)
+			return {
+				body,
+				errorResponse: Response.json(
+					{
+						error: {
+							message: error.message,
+							type: "invalid_request_error",
+							code: "invalid_parallel_tool_bridge",
+							param: "parallel_tool_calls",
+						},
+					},
+					{ status: 400 },
+				),
+			}
 		return { body }
 	}
 }
@@ -879,10 +933,13 @@ const finalizeResponsesResponse = async (
 		const adapted = prepared.patchToolName
 			? adaptPatchResponsesSse(stream, prepared.patchToolName)
 			: stream
+		const parallelAdapted = prepared.parallelToolNames
+			? adaptParallelResponsesSse(adapted, prepared.parallelToolNames)
+			: adapted
 		const headers = new Headers(response.headers)
 		headers.delete("content-encoding")
 		headers.delete("content-length")
-		const normalized = new Response(adapted, {
+		const normalized = new Response(parallelAdapted, {
 			status: response.status,
 			statusText: response.statusText,
 			headers,
@@ -890,13 +947,18 @@ const finalizeResponsesResponse = async (
 		return captureResponsesState(normalized, prepared.requestBody, state)
 	}
 
+	const source = prepared.patchToolName
+		? adaptPatchResponsesSse(
+				normalizeResponsesSse(response.body),
+				prepared.patchToolName,
+			)
+		: prepared.parallelToolNames
+			? normalizeResponsesSse(response.body)
+			: response.body
 	const completed = await collectCompletedResponseFromSse(
-		prepared.patchToolName
-			? adaptPatchResponsesSse(
-					normalizeResponsesSse(response.body),
-					prepared.patchToolName,
-				)
-			: response.body,
+		prepared.parallelToolNames
+			? adaptParallelResponsesSse(source, prepared.parallelToolNames)
+			: source,
 	)
 	state?.rememberResponse(completed, prepared.requestBody)
 	const headers = new Headers(response.headers)

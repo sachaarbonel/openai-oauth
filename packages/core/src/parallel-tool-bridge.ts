@@ -1,0 +1,516 @@
+import { isRecord } from "./utils.js"
+
+export const PARALLEL_TOOL_FUNCTION = "__openai_oauth_parallel"
+const MAX_BATCH_CALLS = 16
+const MAX_BATCH_DESCRIPTION = 64 * 1024
+const MAX_PENDING_EVENT_CHARACTERS = 32 * 1024 * 1024
+const childPrefix = "__openai_oauth_batch_"
+
+export class ParallelToolBridgeError extends Error {}
+
+const encodeId = (value: string): string => {
+	const bytes = new TextEncoder().encode(value)
+	if (bytes.length > 512)
+		throw new ParallelToolBridgeError("Parallel tool ID exceeds the limit.")
+	let binary = ""
+	for (const byte of bytes) binary += String.fromCharCode(byte)
+	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+}
+
+const decodeId = (value: string): string => {
+	if (value.length > 1024)
+		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
+	try {
+		const bytes = Uint8Array.from(
+			atob(value.replace(/-/g, "+").replace(/_/g, "/")),
+			(character) => character.charCodeAt(0),
+		)
+		return new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+	} catch {
+		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
+	}
+}
+
+const childId = (parent: string, index: number, total: number): string =>
+	`${childPrefix}${encodeId(parent)}_${index}_${total}`
+
+const parseChildId = (value: unknown) => {
+	if (typeof value !== "string" || !value.startsWith(childPrefix)) return
+	const match = /^__openai_oauth_batch_([A-Za-z0-9_-]+)_(\d+)_(\d+)$/.exec(
+		value,
+	)
+	if (!match)
+		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
+	const index = Number(match[2])
+	const total = Number(match[3])
+	if (
+		!Number.isSafeInteger(index) ||
+		!Number.isSafeInteger(total) ||
+		total < 1 ||
+		total > MAX_BATCH_CALLS ||
+		index >= total
+	)
+		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
+	const encoded = match[1]
+	if (!encoded)
+		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
+	return { parent: decodeId(encoded), index, total }
+}
+
+export const parallelToolDefinition = (tools: Record<string, unknown>[]) => {
+	if (tools.length === 0 || tools.length > MAX_BATCH_CALLS)
+		throw new ParallelToolBridgeError(
+			"Parallel tool count must be between 1 and 16.",
+		)
+	const names = tools.map((tool) => tool.name)
+	if (
+		names.some(
+			(name) =>
+				typeof name !== "string" || !name || name === PARALLEL_TOOL_FUNCTION,
+		) ||
+		new Set(names).size !== names.length
+	)
+		throw new ParallelToolBridgeError(
+			"Parallel tool names must be unique and cannot use the reserved batch name.",
+		)
+	const catalog = tools.map((tool) => ({
+		name: tool.name,
+		description: tool.description,
+		parameters: tool.parameters,
+	}))
+	const description = `Call one or more independent tools. Each calls[].arguments object must match that tool's parameters. The proxy forwards each call to the client separately. Available tools: ${JSON.stringify(catalog)}`
+	if (description.length > MAX_BATCH_DESCRIPTION)
+		throw new ParallelToolBridgeError(
+			"Parallel tool definitions exceed the description limit.",
+		)
+	return {
+		type: "function",
+		name: PARALLEL_TOOL_FUNCTION,
+		description,
+		strict: false,
+		parameters: {
+			type: "object",
+			properties: {
+				calls: {
+					type: "array",
+					minItems: 1,
+					maxItems: MAX_BATCH_CALLS,
+					items: {
+						type: "object",
+						properties: {
+							name: { type: "string", enum: names },
+							arguments: { type: "object" },
+						},
+						required: ["name", "arguments"],
+						additionalProperties: false,
+					},
+				},
+			},
+			required: ["calls"],
+			additionalProperties: false,
+		},
+	}
+}
+
+type BatchCall = { name: string; arguments: string }
+
+const parseBatchCalls = (
+	item: Record<string, unknown>,
+	names: Set<string>,
+): BatchCall[] => {
+	if (
+		typeof item.arguments !== "string" ||
+		typeof item.call_id !== "string" ||
+		!item.call_id ||
+		typeof item.id !== "string" ||
+		!item.id
+	)
+		throw new ParallelToolBridgeError("Incomplete parallel tool call.")
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(item.arguments)
+	} catch {
+		throw new ParallelToolBridgeError("Invalid parallel tool arguments.")
+	}
+	const calls = isRecord(parsed) ? parsed.calls : undefined
+	if (
+		!Array.isArray(calls) ||
+		calls.length < 1 ||
+		calls.length > MAX_BATCH_CALLS
+	)
+		throw new ParallelToolBridgeError("Invalid parallel tool call count.")
+	return calls.map((call) => {
+		if (
+			!isRecord(call) ||
+			typeof call.name !== "string" ||
+			!names.has(call.name) ||
+			(!isRecord(call.arguments) && typeof call.arguments !== "string")
+		)
+			throw new ParallelToolBridgeError(
+				"Invalid parallel tool name or arguments.",
+			)
+		const argumentsText = isRecord(call.arguments)
+			? JSON.stringify(call.arguments)
+			: (call.arguments as string)
+		try {
+			const value = JSON.parse(argumentsText)
+			if (!isRecord(value)) throw new Error("Expected object")
+		} catch {
+			throw new ParallelToolBridgeError("Invalid parallel tool arguments JSON.")
+		}
+		return { name: call.name, arguments: argumentsText }
+	})
+}
+
+const expandCall = (item: Record<string, unknown>, names: Set<string>) => {
+	const calls = parseBatchCalls(item, names)
+	return calls.map((call, index) => ({
+		type: "function_call",
+		id: childId(item.id as string, index, calls.length),
+		call_id: childId(item.call_id as string, index, calls.length),
+		name: call.name,
+		arguments: call.arguments,
+		status: item.status ?? "completed",
+	}))
+}
+
+const parseClientArguments = (value: unknown): Record<string, unknown> => {
+	if (typeof value !== "string")
+		throw new ParallelToolBridgeError(
+			"Parallel client arguments must be a string.",
+		)
+	try {
+		const parsed: unknown = JSON.parse(value)
+		if (isRecord(parsed)) return parsed
+	} catch {}
+	throw new ParallelToolBridgeError("Invalid parallel client arguments JSON.")
+}
+
+export const adaptParallelInput = (input: unknown[]): unknown[] => {
+	const groups = new Map<
+		string,
+		{
+			total: number
+			parentId?: string
+			calls: Map<number, Record<string, unknown>>
+			outputs: Map<number, Record<string, unknown>>
+		}
+	>()
+	for (const item of input) {
+		if (
+			!isRecord(item) ||
+			(item.type !== "function_call" && item.type !== "function_call_output")
+		)
+			continue
+		const child = parseChildId(item.call_id)
+		if (!child) continue
+		const group = groups.get(child.parent) ?? {
+			total: child.total,
+			parentId: undefined as string | undefined,
+			calls: new Map<number, Record<string, unknown>>(),
+			outputs: new Map<number, Record<string, unknown>>(),
+		}
+		if (group.total !== child.total)
+			throw new ParallelToolBridgeError(
+				"Conflicting parallel tool call counts.",
+			)
+		const destination =
+			item.type === "function_call" ? group.calls : group.outputs
+		if (destination.has(child.index))
+			throw new ParallelToolBridgeError("Duplicate parallel tool item.")
+		destination.set(child.index, item)
+		if (item.type === "function_call") {
+			const id = parseChildId(item.id)
+			if (
+				!id ||
+				id.index !== child.index ||
+				id.total !== child.total ||
+				(group.parentId && group.parentId !== id.parent)
+			)
+				throw new ParallelToolBridgeError("Conflicting parallel tool item ID.")
+			group.parentId = id.parent
+		}
+		groups.set(child.parent, group)
+	}
+	for (const group of groups.values()) {
+		if (
+			!group.parentId ||
+			group.calls.size !== group.total ||
+			group.outputs.size !== group.total
+		)
+			throw new ParallelToolBridgeError(
+				"Parallel tool continuation requires all call outputs.",
+			)
+	}
+	const insertedCalls = new Set<string>()
+	const insertedOutputs = new Set<string>()
+	return input.flatMap((item) => {
+		if (
+			!isRecord(item) ||
+			(item.type !== "function_call" && item.type !== "function_call_output")
+		)
+			return [item]
+		const child = parseChildId(item.call_id)
+		if (!child) return [item]
+		const group = groups.get(child.parent)
+		if (!group)
+			throw new ParallelToolBridgeError("Missing parallel tool group.")
+		if (item.type === "function_call") {
+			if (insertedCalls.has(child.parent)) return []
+			insertedCalls.add(child.parent)
+			return [
+				{
+					type: "function_call",
+					id: group.parentId,
+					call_id: child.parent,
+					name: PARALLEL_TOOL_FUNCTION,
+					status: "completed",
+					arguments: JSON.stringify({
+						calls: Array.from({ length: group.total }, (_, index) => {
+							const call = group.calls.get(index)
+							if (!call)
+								throw new ParallelToolBridgeError("Missing parallel tool call.")
+							return {
+								name: call.name,
+								arguments: parseClientArguments(call.arguments),
+							}
+						}),
+					}),
+				},
+			]
+		}
+		if (insertedOutputs.has(child.parent)) return []
+		insertedOutputs.add(child.parent)
+		return [
+			{
+				type: "function_call_output",
+				call_id: child.parent,
+				output: JSON.stringify({
+					results: Array.from({ length: group.total }, (_, index) => {
+						const call = group.calls.get(index)
+						const output = group.outputs.get(index)
+						if (!call || !output)
+							throw new ParallelToolBridgeError("Missing parallel tool result.")
+						if (typeof output.output !== "string")
+							throw new ParallelToolBridgeError(
+								"Parallel tool output must be a string.",
+							)
+						return {
+							name: call.name,
+							output: output.output,
+							...(output.status === undefined ? {} : { status: output.status }),
+						}
+					}),
+				}),
+			},
+		]
+	})
+}
+
+const separator = /\r?\n\r?\n/
+const frame = (payload: Record<string, unknown>) =>
+	`event: ${payload.type}\ndata: ${JSON.stringify(payload)}\n\n`
+
+/** Expand only the reserved batch function; never execute client tools in the proxy. */
+export const adaptParallelResponsesSse = (
+	stream: ReadableStream<Uint8Array>,
+	names: Set<string>,
+): ReadableStream<Uint8Array> => {
+	const decoder = new TextDecoder("utf-8", { fatal: true })
+	const encoder = new TextEncoder()
+	let pending = ""
+	let buffered: string[] | undefined
+	let bufferedCharacters = 0
+	let batchIndex: number | undefined
+	let offset = 0
+	let sequence = 0
+	let sequenceEnabled = false
+	const rewrite = (block: string): Record<string, unknown>[] => {
+		const data = block
+			.split(/\r?\n/)
+			.filter((line) => line.startsWith("data:"))
+			.map((line) => line.slice(5).trimStart())
+			.join("\n")
+		let value: unknown
+		try {
+			value = JSON.parse(data)
+		} catch {
+			return []
+		}
+		if (!isRecord(value)) return []
+		const type = value.type
+		const index = value.output_index
+		const item = value.item
+		if (
+			batchIndex !== undefined &&
+			(type === "error" ||
+				type === "response.failed" ||
+				type === "response.incomplete" ||
+				type === "response.cancelled" ||
+				type === "response.canceled")
+		) {
+			batchIndex = undefined
+			buffered = undefined
+			return [value]
+		}
+		if (
+			type === "response.output_item.added" &&
+			isRecord(item) &&
+			item.type === "function_call" &&
+			item.name === PARALLEL_TOOL_FUNCTION &&
+			typeof index === "number"
+		) {
+			if (batchIndex !== undefined)
+				throw new ParallelToolBridgeError(
+					"Interleaved parallel tool calls are unsupported.",
+				)
+			batchIndex = index
+			buffered = []
+			bufferedCharacters = 0
+			return []
+		}
+		if (
+			type === "response.output_item.done" &&
+			isRecord(item) &&
+			item.type === "function_call" &&
+			item.name === PARALLEL_TOOL_FUNCTION &&
+			typeof index === "number"
+		) {
+			if (batchIndex !== undefined && index !== batchIndex)
+				throw new ParallelToolBridgeError("Conflicting parallel output index.")
+			const children = expandCall(item, names)
+			const start = index + offset
+			const events = children.flatMap((child, position) => {
+				const output_index = start + position
+				return [
+					{
+						type: "response.output_item.added",
+						output_index,
+						item: { ...child, arguments: "", status: "in_progress" },
+					},
+					{
+						type: "response.function_call_arguments.delta",
+						output_index,
+						item_id: child.id,
+						delta: child.arguments,
+					},
+					{
+						type: "response.function_call_arguments.done",
+						output_index,
+						item_id: child.id,
+						arguments: child.arguments,
+					},
+					{ type: "response.output_item.done", output_index, item: child },
+				]
+			})
+			offset += children.length - 1
+			batchIndex = undefined
+			return events
+		}
+		if (
+			batchIndex !== undefined &&
+			index === batchIndex &&
+			typeof type === "string" &&
+			type.startsWith("response.function_call_arguments.")
+		)
+			return []
+		if (
+			type === "response.completed" &&
+			isRecord(value.response) &&
+			Array.isArray(value.response.output)
+		) {
+			return [
+				{
+					...value,
+					response: {
+						...value.response,
+						output: value.response.output.flatMap((entry) =>
+							isRecord(entry) &&
+							entry.type === "function_call" &&
+							entry.name === PARALLEL_TOOL_FUNCTION
+								? expandCall(entry, names)
+								: [entry],
+						),
+					},
+				},
+			]
+		}
+		if (typeof index === "number")
+			return [{ ...value, output_index: index + offset }]
+		return [value]
+	}
+	const emit = (
+		block: string,
+		controller: TransformStreamDefaultController<Uint8Array>,
+	) => {
+		const data = block.split(/\r?\n/).find((line) => line.startsWith("data:"))
+		if (!data) {
+			controller.enqueue(encoder.encode(`${block}\n\n`))
+			return
+		}
+		if (data.trim() === "data: [DONE]") {
+			if (batchIndex !== undefined)
+				throw new ParallelToolBridgeError(
+					"Parallel tool call ended before completion.",
+				)
+			controller.enqueue(encoder.encode(`${block}\n\n`))
+			return
+		}
+		const before = batchIndex
+		const events = rewrite(block)
+		if (batchIndex !== undefined) {
+			if (before !== undefined && events.length > 0) {
+				if (!buffered)
+					throw new ParallelToolBridgeError("Missing parallel SSE buffer.")
+				buffered.push(block)
+				bufferedCharacters += block.length
+				if (bufferedCharacters > MAX_PENDING_EVENT_CHARACTERS)
+					throw new ParallelToolBridgeError(
+						"Parallel SSE buffer limit exceeded.",
+					)
+			}
+			return
+		}
+		for (const event of events) {
+			if (typeof event.sequence_number === "number") sequenceEnabled = true
+			controller.enqueue(
+				encoder.encode(
+					frame({
+						...event,
+						...(sequenceEnabled ? { sequence_number: sequence++ } : {}),
+					}),
+				),
+			)
+		}
+		if (before !== undefined && buffered) {
+			const held = buffered
+			buffered = undefined
+			for (const item of held) emit(item, controller)
+		}
+	}
+	return stream.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				pending += decoder.decode(chunk, { stream: true })
+				let match = separator.exec(pending)
+				while (match) {
+					emit(pending.slice(0, match.index), controller)
+					pending = pending.slice(match.index + match[0].length)
+					match = separator.exec(pending)
+				}
+				if (pending.length > MAX_PENDING_EVENT_CHARACTERS)
+					throw new ParallelToolBridgeError(
+						"Parallel SSE event size limit exceeded.",
+					)
+			},
+			flush(controller) {
+				pending += decoder.decode()
+				if (pending) emit(pending, controller)
+				if (batchIndex !== undefined)
+					throw new ParallelToolBridgeError(
+						"Parallel tool call ended before completion.",
+					)
+			},
+		}),
+	)
+}
