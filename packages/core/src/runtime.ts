@@ -680,10 +680,9 @@ const applyModelDefaults = (
 
 	normalized.input = [...prefix, ...input]
 	normalized.instructions = ""
-	// Lite's historical default must not override an SDK caller's explicit choice.
-	if (normalized.parallel_tool_calls === undefined) {
-		normalized.parallel_tool_calls = false
-	}
+	// The Codex Responses Lite endpoint only accepts false, even when the model
+	// catalog says the model supports parallel tools in other modes.
+	normalized.parallel_tool_calls = false
 	if (hostedTools.length > 0) {
 		normalized.tools = hostedTools
 	} else {
@@ -721,6 +720,7 @@ export const normalizeCodexResponsesBody = (
 
 type PreparedResponsesRequestBody = {
 	body: BodyInit | null | undefined
+	errorResponse?: Response
 	requestBody?: Record<string, unknown>
 	wantsStream?: boolean
 	useResponsesLite?: boolean
@@ -775,6 +775,23 @@ const prepareResponsesRequestBody = async (
 			typeof parsed.model === "string"
 				? await resolveModelInfo(auth, parsed.model)
 				: undefined
+		if (modelInfo?.useResponsesLite && parsed.parallel_tool_calls === true) {
+			return {
+				body,
+				errorResponse: Response.json(
+					{
+						error: {
+							message:
+								"Responses Lite requires parallel_tool_calls=false. To run independent tools concurrently, expose one client-side batch tool and execute its operations in parallel.",
+							type: "invalid_request_error",
+							code: "unsupported_parallel_tool_calls",
+							param: "parallel_tool_calls",
+						},
+					},
+					{ status: 400 },
+				),
+			}
+		}
 
 		const normalized = normalizeCodexResponsesBodyInternal(parsed, {
 			forceStream: true,
@@ -1084,6 +1101,9 @@ const createCodexOAuthFetch = (
 			auth,
 			resolveModelInfo,
 		)
+		if (preparedBody.errorResponse) {
+			return preparedBody.errorResponse
+		}
 
 		const bridge =
 			settings.standaloneSearch === true &&

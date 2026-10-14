@@ -243,7 +243,7 @@ describe("createCodexOAuthFetch", () => {
 				instructions: "Be concise.",
 				input: "Hello",
 				tools: [{ type: "function", name: "weather" }],
-				parallel_tool_calls: true,
+				parallel_tool_calls: false,
 			}),
 		})
 
@@ -260,7 +260,7 @@ describe("createCodexOAuthFetch", () => {
 		expect(body.stream).toBe(true)
 		expect(body).toMatchObject({
 			instructions: "",
-			parallel_tool_calls: true,
+			parallel_tool_calls: false,
 			reasoning: { effort: "low", context: "all_turns" },
 			text: { verbosity: "low" },
 		})
@@ -283,13 +283,11 @@ describe("createCodexOAuthFetch", () => {
 	})
 
 	test.each([
-		{ stream: true, parallel: true, expected: true },
 		{ stream: true, parallel: false, expected: false },
 		{ stream: true, parallel: undefined, expected: false },
-		{ stream: false, parallel: true, expected: true },
 		{ stream: false, parallel: false, expected: false },
 		{ stream: false, parallel: undefined, expected: false },
-	])("preserves Lite parallel choice $parallel (stream=$stream)", async ({
+	])("sends the supported Lite parallel choice $parallel (stream=$stream)", async ({
 		stream,
 		parallel,
 		expected,
@@ -329,6 +327,54 @@ describe("createCodexOAuthFetch", () => {
 				{ type: "function", name: "read_layout" },
 			],
 		})
+	})
+
+	test.each([
+		true,
+		false,
+	])("rejects native Lite parallel calls before upstream fetch (stream=%s)", async (stream) => {
+		const fetch = createMockFetch()
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+		const response = await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-6.1-sol",
+				input: "Read both settings.",
+				stream,
+				parallel_tool_calls: true,
+				tools: [{ type: "function", name: "read_palette" }],
+			}),
+		})
+		expect(response.status).toBe(400)
+		await expect(response.json()).resolves.toMatchObject({
+			error: {
+				type: "invalid_request_error",
+				code: "unsupported_parallel_tool_calls",
+				param: "parallel_tool_calls",
+			},
+		})
+		expect(upstreamCalls(fetch)).toHaveLength(0)
+	})
+
+	test("preserves native parallel calls for non-Lite models", async () => {
+		const fetch = createMockFetch()
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+		await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-5.2",
+				input: "Read both settings.",
+				stream: true,
+				parallel_tool_calls: true,
+			}),
+		})
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		expect(JSON.parse(String(init?.body)).parallel_tool_calls).toBe(true)
+		expect(
+			new Headers(init?.headers).has("x-openai-internal-codex-responses-lite"),
+		).toBe(false)
 	})
 
 	test("keeps hosted web search in top-level tools for Responses Lite", async () => {
