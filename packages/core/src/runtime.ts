@@ -680,7 +680,10 @@ const applyModelDefaults = (
 
 	normalized.input = [...prefix, ...input]
 	normalized.instructions = ""
-	normalized.parallel_tool_calls = false
+	// Lite's historical default must not override an SDK caller's explicit choice.
+	if (normalized.parallel_tool_calls === undefined) {
+		normalized.parallel_tool_calls = false
+	}
 	if (hostedTools.length > 0) {
 		normalized.tools = hostedTools
 	} else {
@@ -872,7 +875,10 @@ const finalizeResponsesResponse = async (
 
 	const completed = await collectCompletedResponseFromSse(
 		prepared.patchToolName
-			? adaptPatchResponsesSse(normalizeResponsesSse(response.body), prepared.patchToolName)
+			? adaptPatchResponsesSse(
+					normalizeResponsesSse(response.body),
+					prepared.patchToolName,
+				)
 			: response.body,
 	)
 	state?.rememberResponse(completed, prepared.requestBody)

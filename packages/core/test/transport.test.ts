@@ -32,6 +32,12 @@ const createMockFetch = (
 					models: [
 						{ slug: "gpt-5.2", visibility: "list" },
 						{ slug: "gpt-5.4-mini", visibility: "list" },
+						{
+							slug: "gpt-6.1-sol",
+							visibility: "list",
+							use_responses_lite: true,
+							supports_parallel_tool_calls: true,
+						},
 						{ slug: "codex-auto-review", visibility: "hide" },
 						{
 							slug: "gpt-5.6-sol",
@@ -147,6 +153,7 @@ describe("createCodexOAuthFetch", () => {
 		expect(payload.data.map((model: { id: string }) => model.id)).toEqual([
 			"gpt-5.2",
 			"gpt-5.4-mini",
+			"gpt-6.1-sol",
 			"gpt-5.6-sol",
 			"gpt-6-astra",
 			"gpt-image-2",
@@ -253,7 +260,7 @@ describe("createCodexOAuthFetch", () => {
 		expect(body.stream).toBe(true)
 		expect(body).toMatchObject({
 			instructions: "",
-			parallel_tool_calls: false,
+			parallel_tool_calls: true,
 			reasoning: { effort: "low", context: "all_turns" },
 			text: { verbosity: "low" },
 		})
@@ -273,6 +280,55 @@ describe("createCodexOAuthFetch", () => {
 				content: [{ type: "input_text", text: "Hello" }],
 			},
 		])
+	})
+
+	test.each([
+		{ stream: true, parallel: true, expected: true },
+		{ stream: true, parallel: false, expected: false },
+		{ stream: true, parallel: undefined, expected: false },
+		{ stream: false, parallel: true, expected: true },
+		{ stream: false, parallel: false, expected: false },
+		{ stream: false, parallel: undefined, expected: false },
+	])("preserves Lite parallel choice $parallel (stream=$stream)", async ({
+		stream,
+		parallel,
+		expected,
+	}) => {
+		const fetch = createMockFetch(
+			async () =>
+				new Response(
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_parallel","status":"completed","output":[]}}\n\n',
+					{ headers: { "Content-Type": "text/event-stream" } },
+				),
+		)
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+		const response = await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-6.1-sol",
+				input: "Read both settings.",
+				stream,
+				parallel_tool_calls: parallel,
+				tools: [
+					{ type: "function", name: "read_palette" },
+					{ type: "function", name: "read_layout" },
+				],
+			}),
+		})
+		await response.text()
+		expect(upstreamCalls(fetch)).toHaveLength(1)
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		const body = JSON.parse(String(init?.body))
+		expect(body.parallel_tool_calls).toBe(expected)
+		expect(body.stream).toBe(true)
+		expect(body.input[0]).toMatchObject({
+			type: "additional_tools",
+			tools: [
+				{ type: "function", name: "read_palette" },
+				{ type: "function", name: "read_layout" },
+			],
+		})
 	})
 
 	test("keeps hosted web search in top-level tools for Responses Lite", async () => {
