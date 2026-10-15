@@ -17,18 +17,16 @@ const encodeId = (value: string): string => {
 	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
 }
 
-const decodeId = (value: string): string => {
-	if (value.length > 1024)
-		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
+const decodeId = (value: string): string | undefined => {
+	if (value.length > 1024) return
 	try {
 		const bytes = Uint8Array.from(
 			atob(value.replace(/-/g, "+").replace(/_/g, "/")),
 			(character) => character.charCodeAt(0),
 		)
+		if (bytes.length === 0 || bytes.length > 512) return
 		return new TextDecoder("utf-8", { fatal: true }).decode(bytes)
-	} catch {
-		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
-	}
+	} catch {}
 }
 
 const childId = (parent: string, index: number, total: number): string =>
@@ -39,8 +37,7 @@ const parseChildId = (value: unknown) => {
 	const match = /^__openai_oauth_batch_([A-Za-z0-9_-]+)_(\d+)_(\d+)$/.exec(
 		value,
 	)
-	if (!match)
-		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
+	if (!match) return
 	const index = Number(match[2])
 	const total = Number(match[3])
 	if (
@@ -50,11 +47,12 @@ const parseChildId = (value: unknown) => {
 		total > MAX_BATCH_CALLS ||
 		index >= total
 	)
-		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
+		return
 	const encoded = match[1]
-	if (!encoded)
-		throw new ParallelToolBridgeError("Invalid parallel tool call ID.")
-	return { parent: decodeId(encoded), index, total }
+	if (!encoded) return
+	const parent = decodeId(encoded)
+	if (parent === undefined || childId(parent, index, total) !== value) return
+	return { parent, index, total }
 }
 
 export const parallelToolDefinition = (tools: Record<string, unknown>[]) => {
@@ -174,24 +172,34 @@ const expandCall = (item: Record<string, unknown>, names: Set<string>) => {
 	}))
 }
 
-const parseClientArguments = (value: unknown): Record<string, unknown> => {
-	if (typeof value !== "string")
-		throw new ParallelToolBridgeError(
-			"Parallel client arguments must be a string.",
-		)
+const parseClientArguments = (
+	value: unknown,
+): Record<string, unknown> | undefined => {
+	if (typeof value !== "string") return
 	try {
 		const parsed: unknown = JSON.parse(value)
 		if (isRecord(parsed)) return parsed
 	} catch {}
-	throw new ParallelToolBridgeError("Invalid parallel client arguments JSON.")
 }
+
+// Images (and unknown content types) must remain real tool output content, not
+// strings embedded in the batch JSON, so replay their entire group unbatched.
+const canFoldOutput = (value: unknown): boolean =>
+	typeof value === "string" ||
+	(Array.isArray(value) &&
+		value.every(
+			(part) =>
+				isRecord(part) &&
+				part.type === "input_text" &&
+				typeof part.text === "string",
+		))
 
 export const adaptParallelInput = (input: unknown[]): unknown[] => {
 	const groups = new Map<
 		string,
 		{
 			total: number
-			parentId?: string
+			valid: boolean
 			calls: Map<number, Record<string, unknown>>
 			outputs: Map<number, Record<string, unknown>>
 		}
@@ -206,41 +214,75 @@ export const adaptParallelInput = (input: unknown[]): unknown[] => {
 		if (!child) continue
 		const group = groups.get(child.parent) ?? {
 			total: child.total,
-			parentId: undefined as string | undefined,
+			valid: true,
 			calls: new Map<number, Record<string, unknown>>(),
 			outputs: new Map<number, Record<string, unknown>>(),
 		}
-		if (group.total !== child.total)
-			throw new ParallelToolBridgeError(
-				"Conflicting parallel tool call counts.",
-			)
 		const destination =
 			item.type === "function_call" ? group.calls : group.outputs
-		if (destination.has(child.index))
-			throw new ParallelToolBridgeError("Duplicate parallel tool item.")
+		if (group.total !== child.total || destination.has(child.index))
+			group.valid = false
 		destination.set(child.index, item)
-		if (item.type === "function_call") {
-			const id = parseChildId(item.id)
-			if (
-				!id ||
-				id.index !== child.index ||
-				id.total !== child.total ||
-				(group.parentId && group.parentId !== id.parent)
-			)
-				throw new ParallelToolBridgeError("Conflicting parallel tool item ID.")
-			group.parentId = id.parent
-		}
 		groups.set(child.parent, group)
 	}
-	for (const group of groups.values()) {
+	const folded = new Map<
+		string,
+		{ call: Record<string, unknown>; output: Record<string, unknown> }
+	>()
+	for (const [parent, group] of groups) {
 		if (
-			!group.parentId ||
+			!group.valid ||
 			group.calls.size !== group.total ||
 			group.outputs.size !== group.total
 		)
-			throw new ParallelToolBridgeError(
-				"Parallel tool continuation requires all call outputs.",
+			continue
+		const calls = []
+		const results = []
+		const parentIds = new Set<string>()
+		for (let index = 0; index < group.total; index++) {
+			const call = group.calls.get(index)
+			const output = group.outputs.get(index)
+			const args = parseClientArguments(call?.arguments)
+			if (
+				!call ||
+				!output ||
+				typeof call.name !== "string" ||
+				!call.name ||
+				!args ||
+				!canFoldOutput(output.output)
 			)
+				break
+			calls.push({ name: call.name, arguments: args })
+			results.push({
+				name: call.name,
+				output: output.output,
+				...(output.status === undefined ? {} : { status: output.status }),
+			})
+			const id = parseChildId(call.id)
+			if (id?.index === index && id.total === group.total)
+				parentIds.add(id.parent)
+		}
+		// Decide for the whole group before replacing anything in the history.
+		if (calls.length !== group.total) continue
+		// Item IDs are only a hint for preserving an upstream ID. SDKs may omit
+		// or rewrite them; call_id alone determines the group and fallback ID.
+		const parentId =
+			parentIds.size === 1 ? parentIds.values().next().value : undefined
+		folded.set(parent, {
+			call: {
+				type: "function_call",
+				id: parentId ?? `fc_${encodeId(parent)}`,
+				call_id: parent,
+				name: PARALLEL_TOOL_FUNCTION,
+				status: "completed",
+				arguments: JSON.stringify({ calls }),
+			},
+			output: {
+				type: "function_call_output",
+				call_id: parent,
+				output: JSON.stringify({ results }),
+			},
+		})
 	}
 	const insertedCalls = new Set<string>()
 	const insertedOutputs = new Set<string>()
@@ -252,58 +294,16 @@ export const adaptParallelInput = (input: unknown[]): unknown[] => {
 			return [item]
 		const child = parseChildId(item.call_id)
 		if (!child) return [item]
-		const group = groups.get(child.parent)
-		if (!group)
-			throw new ParallelToolBridgeError("Missing parallel tool group.")
+		const group = folded.get(child.parent)
+		if (!group) return [item]
 		if (item.type === "function_call") {
 			if (insertedCalls.has(child.parent)) return []
 			insertedCalls.add(child.parent)
-			return [
-				{
-					type: "function_call",
-					id: group.parentId,
-					call_id: child.parent,
-					name: PARALLEL_TOOL_FUNCTION,
-					status: "completed",
-					arguments: JSON.stringify({
-						calls: Array.from({ length: group.total }, (_, index) => {
-							const call = group.calls.get(index)
-							if (!call)
-								throw new ParallelToolBridgeError("Missing parallel tool call.")
-							return {
-								name: call.name,
-								arguments: parseClientArguments(call.arguments),
-							}
-						}),
-					}),
-				},
-			]
+			return [group.call]
 		}
 		if (insertedOutputs.has(child.parent)) return []
 		insertedOutputs.add(child.parent)
-		return [
-			{
-				type: "function_call_output",
-				call_id: child.parent,
-				output: JSON.stringify({
-					results: Array.from({ length: group.total }, (_, index) => {
-						const call = group.calls.get(index)
-						const output = group.outputs.get(index)
-						if (!call || !output)
-							throw new ParallelToolBridgeError("Missing parallel tool result.")
-						if (typeof output.output !== "string")
-							throw new ParallelToolBridgeError(
-								"Parallel tool output must be a string.",
-							)
-						return {
-							name: call.name,
-							output: output.output,
-							...(output.status === undefined ? {} : { status: output.status }),
-						}
-					}),
-				}),
-			},
-		]
+		return [group.output]
 	})
 }
 

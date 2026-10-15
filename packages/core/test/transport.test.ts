@@ -385,6 +385,114 @@ describe("createCodexOAuthFetch", () => {
 		).toBe(false)
 	})
 
+	test.each([
+		{
+			shape: "missing item ID",
+			id: undefined,
+			output: "done",
+			args: "{}",
+			folds: true,
+		},
+		{
+			shape: "rewritten item ID",
+			id: "fc_sdk",
+			output: "done",
+			args: "{}",
+			folds: true,
+		},
+		{
+			shape: "text content array",
+			id: undefined,
+			output: [{ type: "input_text", text: "done" }],
+			args: "{}",
+			folds: true,
+		},
+		{
+			shape: "image content array",
+			id: "fc_sdk",
+			output: [
+				{ type: "input_text", text: "Screenshot" },
+				{ type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
+			],
+			args: "{}",
+			folds: false,
+		},
+		{
+			shape: "non-string arguments",
+			id: "fc_sdk",
+			output: "done",
+			args: {},
+			folds: false,
+		},
+	])("forwards SDK parallel history with $shape without a bridge 400", async ({
+		id,
+		output,
+		args,
+		folds,
+	}) => {
+		const fetch = createMockFetch(
+			async () =>
+				new Response(
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_replay","status":"completed","output":[]}}\n\n',
+					{ headers: { "Content-Type": "text/event-stream" } },
+				),
+		)
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+		const call_id = `__openai_oauth_batch_${btoa("call_parent").replace(/=+$/, "")}_0_1`
+		const history = [
+			{
+				role: "user",
+				content: [{ type: "input_text", text: "Inspect the sandbox." }],
+			},
+			{
+				type: "function_call",
+				id,
+				call_id,
+				name: "view_image",
+				arguments: args,
+			},
+			{ type: "function_call_output", call_id, output },
+		]
+		const response = await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-6.1-sol",
+				stream: true,
+				parallel_tool_calls: true,
+				tools: [
+					{ type: "function", name: "exec_command" },
+					{ type: "function", name: "view_image" },
+					{ type: "custom", name: "apply_patch" },
+				],
+				input: history,
+			}),
+		})
+		expect(response.status).toBe(200)
+		await response.text()
+		expect(upstreamCalls(fetch)).toHaveLength(1)
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		const body = JSON.parse(String(init?.body))
+		expect(body.parallel_tool_calls).toBe(false)
+		expect(body.tools).toEqual([{ type: "custom", name: "apply_patch" }])
+		if (folds) {
+			expect(body.input.slice(-2)).toEqual([
+				expect.objectContaining({
+					type: "function_call",
+					call_id: "call_parent",
+					name: "__openai_oauth_parallel",
+				}),
+				{
+					type: "function_call_output",
+					call_id: "call_parent",
+					output: JSON.stringify({ results: [{ name: "view_image", output }] }),
+				},
+			])
+		} else {
+			expect(body.input.slice(1)).toEqual(JSON.parse(JSON.stringify(history)))
+		}
+	})
+
 	test("rejects an unsupported Lite parallel mix without forwarding it upstream", async () => {
 		const fetch = createMockFetch()
 		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
