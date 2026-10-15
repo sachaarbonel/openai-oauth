@@ -71,6 +71,36 @@ const continuation = (parent = batch.call_id): Record<string, unknown>[] => {
 	]
 }
 
+// Ambiguous/partial groups keep their tool/result correspondence without
+// carrying the bridge's private IDs into Lite's function-item schema.
+const expectSafeReplay = (input: unknown[]) => {
+	const before = JSON.stringify(input)
+	const replayed = adaptParallelInput(input) as Record<string, unknown>[]
+	expect(replayed).toHaveLength(input.length)
+	const ids = new Map<unknown, unknown>()
+	for (const [index, original] of (
+		input as Record<string, unknown>[]
+	).entries()) {
+		const item = replayed[index]
+		expect(item.type).toBe(original.type)
+		expect(item.call_id).toMatch(/^call_[A-Za-z0-9_-]+$/)
+		if (ids.has(original.call_id))
+			expect(item.call_id).toBe(ids.get(original.call_id))
+		ids.set(original.call_id, item.call_id)
+		if (item.type === "function_call") {
+			expect(item.id).toMatch(/^fc_[A-Za-z0-9_-]+$/)
+			expect(item.name).toBe(original.name)
+			expect(typeof item.arguments).toBe("string")
+		} else {
+			expect(typeof item.output).toBe("string")
+			if (typeof original.output === "string")
+				expect(item.output).toBe(original.output)
+		}
+	}
+	expect(JSON.stringify(input)).toBe(before)
+	return replayed
+}
+
 describe("Responses Lite parallel tool bridge", () => {
 	test("advertises only one model-facing batch function", () => {
 		const definition = parallelToolDefinition([
@@ -247,36 +277,59 @@ describe("Responses Lite parallel tool bridge", () => {
 				{ type: "input_text", text: "\nsecond part" },
 			],
 		].map((parts) => ({ parts })),
-	)("folds text content arrays losslessly: $parts", ({ parts }) => {
+	)("folds text content arrays into string outputs: $parts", ({ parts }) => {
 		const input = continuation()
 		input[2].output = parts
 		const folded = adaptParallelInput(input) as Record<string, unknown>[]
 		expect(folded).toHaveLength(2)
 		expect(JSON.parse(folded[1].output as string).results).toEqual([
-			{ name: "read_palette", output: parts },
+			{
+				name: "read_palette",
+				output: parts.map((part) => part.text).join("\n"),
+			},
 			{ name: "read_layout", output: "grid" },
 		])
 	})
 
-	test.each(
-		[
-			[{ type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" }],
-			[
+	test.each([
+		{
+			output: [
+				{ type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
+			],
+			text: "[Image omitted: Responses Lite tool outputs support text only.]",
+		},
+		{
+			output: [
 				{ type: "input_text", text: "Screenshot" },
 				{ type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
 			],
-			[{ type: "input_file", file_id: "file_fixture" }],
-			[{ type: "input_text", text: 123 }],
-			{ structured: "result" },
-			null,
-		].map((output) => ({ output })),
-	)("replays the whole group for non-text output: $output", ({ output }) => {
+			text: "Screenshot\n[Image omitted: Responses Lite tool outputs support text only.]",
+		},
+		{
+			output: [{ type: "input_file", file_id: "file_fixture" }],
+			text: "[File omitted: Responses Lite tool outputs support text only.]",
+		},
+		{
+			output: [{ type: "input_text", text: 123 }],
+			text: "[Unsupported tool output content omitted: Responses Lite tool outputs support text only.]",
+		},
+		{ output: { structured: "result" }, text: '{"structured":"result"}' },
+		{ output: null, text: "null" },
+	])("folds non-text output into accepted strings: $output", ({
+		output,
+		text,
+	}) => {
 		const input = continuation()
 		input[3].output = output
-		const replayed = adaptParallelInput(input)
-		expect(replayed).toEqual(input)
-		for (const [index, item] of input.entries())
-			expect(replayed[index]).toBe(item)
+		const folded = adaptParallelInput(input) as Record<string, unknown>[]
+		expect(folded).toHaveLength(2)
+		expect(folded[0]).toMatchObject({ id: batch.id, call_id: batch.call_id })
+		expect(JSON.parse(folded[1].output as string).results).toEqual([
+			{ name: "read_palette", output: "blue" },
+			{ name: "read_layout", output: text },
+		])
+		expect(folded[1].output).not.toContain("data:image")
+		expect(input[3].output).toBe(output)
 	})
 
 	test.each([
@@ -290,10 +343,10 @@ describe("Responses Lite parallel tool bridge", () => {
 	])("replays the whole group for incompatible client arguments: %j", (args) => {
 		const input = continuation()
 		input[1].arguments = args
-		expect(adaptParallelInput(input)).toEqual(input)
+		expectSafeReplay(input)
 	})
 
-	test("folds safe groups independently while preserving images and other history", () => {
+	test("folds image and text groups independently while preserving other history", () => {
 		const imageGroup = continuation("call_image")
 		imageGroup[2].output = [
 			{ type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
@@ -302,19 +355,19 @@ describe("Responses Lite parallel tool bridge", () => {
 		const input = [message, ...imageGroup, ...safeGroup, message]
 		expect(adaptParallelInput(input)).toEqual([
 			message,
-			...imageGroup,
+			...adaptParallelInput(imageGroup),
 			...adaptParallelInput(safeGroup),
 			message,
 		])
 		expect(input).toHaveLength(10)
 	})
 
-	test("passes duplicate items and conflicting batch counts through unchanged", () => {
+	test("safely replays duplicate items and conflicting batch counts", () => {
 		const input = continuation()
 		const duplicate = [...input, input[0], input[2]]
-		expect(adaptParallelInput(duplicate)).toEqual(duplicate)
+		expectSafeReplay(duplicate)
 		input[1].call_id = String(input[1].call_id).replace(/_2$/, "_3")
-		expect(adaptParallelInput(input)).toEqual(input)
+		expectSafeReplay(input)
 	})
 
 	test.each([
@@ -324,12 +377,12 @@ describe("Responses Lite parallel tool bridge", () => {
 		"__openai_oauth_batch_YQ_0_17",
 		"__openai_oauth_batch__w_0_1",
 		`__openai_oauth_batch_${"YQ".repeat(600)}_0_1`,
-	])("passes malformed child call IDs through unchanged: %s", (call_id) => {
+	])("safely remaps malformed child call IDs: %s", (call_id) => {
 		const input = [
 			{ type: "function_call", call_id, name: "read_palette", arguments: "{}" },
 			{ type: "function_call_output", call_id, output: "blue" },
 		]
-		expect(adaptParallelInput(input)).toEqual(input)
+		expectSafeReplay(input)
 	})
 
 	test("replays incomplete continuations without inventing tool results", async () => {
@@ -359,7 +412,28 @@ describe("Responses Lite parallel tool bridge", () => {
 				output: "blue",
 			},
 		]
-		expect(adaptParallelInput(input)).toEqual(input)
+		expectSafeReplay(input)
+	})
+
+	test("keeps fallback IDs distinct from ordinary and reconstructed parent IDs", () => {
+		const partial = continuation("call_partial").slice(0, 3)
+		const ordinary = {
+			type: "function_call",
+			id: "fc_call_openai_oauth_1",
+			call_id: "call_openai_oauth_0",
+			name: "ordinary",
+			arguments: "{}",
+		}
+		const folded = continuation("call_openai_oauth_2")
+		const input = [ordinary, ...folded, ...partial]
+		const replay = adaptParallelInput(input) as Record<string, unknown>[]
+		expect(replay[0]).toBe(ordinary)
+		expect(replay[1].call_id).toBe("call_openai_oauth_2")
+		expect(replay.slice(3).map((item) => item.call_id)).toEqual([
+			"call_openai_oauth_3",
+			"call_openai_oauth_4",
+			"call_openai_oauth_3",
+		])
 	})
 
 	test("preserves an upstream error after an unfinished batch call", async () => {

@@ -1,5 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import {
+	diagnosticInputType,
+	summarizeRequestInput,
+} from "./responses-input-diagnostics.js"
+import {
 	type ResponsesLifecycleTrace,
 	safeStreamErrorName,
 } from "./responses-lifecycle-diagnostics.js"
@@ -68,10 +72,12 @@ type UpstreamSummary = {
 	responsesLite: boolean
 	capture: "captured" | "unavailable"
 	tools?: ReturnType<typeof summarizeRequestTools>
+	input?: ReturnType<typeof summarizeRequestInput>
 }
 const context = new AsyncLocalStorage<{
 	upstream?: UpstreamSummary
 	trace?: ResponsesLifecycleTrace
+	inputTypes?: string[]
 }>()
 
 export const withResponsesRequestDiagnostics = <T>(
@@ -88,6 +94,8 @@ export const withResponsesRequestDiagnostics = <T>(
 		: run()
 
 export const upstreamRequestSummary = () => context.getStore()?.upstream
+export const upstreamInputType = (index: number) =>
+	context.getStore()?.inputTypes?.[index]
 
 const observeUpstreamBody = (
 	response: Response,
@@ -203,10 +211,17 @@ export const observeResponsesFetch =
 						capture: "unavailable",
 					}
 					current.upstream = summary
-					if (typeof init?.body === "string" && init.body.length <= 1_048_576) {
+					current.inputTypes = undefined
+					// Image replay bodies routinely exceed 1 MiB. Parse the already
+					// serialized body, retaining ONLY bounded structural summaries.
+					if (typeof init?.body === "string") {
 						const body: unknown = JSON.parse(init.body)
 						if (isRecord(body)) {
 							summary.tools = summarizeRequestTools(body)
+							summary.input = summarizeRequestInput(body, summary.responsesLite)
+							current.inputTypes = Array.isArray(body.input)
+								? body.input.map(diagnosticInputType)
+								: undefined
 							summary.capture = "captured"
 						}
 					}

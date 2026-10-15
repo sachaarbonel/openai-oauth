@@ -29,8 +29,13 @@ const decodeId = (value: string): string | undefined => {
 	} catch {}
 }
 
-const childId = (parent: string, index: number, total: number): string =>
-	`${childPrefix}${encodeId(parent)}_${index}_${total}`
+const childId = (
+	parent: string,
+	index: number,
+	total: number,
+	parentId?: string,
+): string =>
+	`${childPrefix}${encodeId(parentId ? JSON.stringify([parent, parentId]) : parent)}_${index}_${total}`
 
 const parseChildId = (value: unknown) => {
 	if (typeof value !== "string" || !value.startsWith(childPrefix)) return
@@ -50,9 +55,32 @@ const parseChildId = (value: unknown) => {
 		return
 	const encoded = match[1]
 	if (!encoded) return
-	const parent = decodeId(encoded)
-	if (parent === undefined || childId(parent, index, total) !== value) return
-	return { parent, index, total }
+	const decoded = decodeId(encoded)
+	if (decoded === undefined) return
+	let parent = decoded
+	let parentId: string | undefined
+	// New call IDs retain BOTH upstream IDs even if an SDK drops every item ID.
+	// Keep decoding the original single-ID format for histories already in use.
+	if (decoded.startsWith("[")) {
+		try {
+			const pair: unknown = JSON.parse(decoded)
+			if (
+				!Array.isArray(pair) ||
+				pair.length !== 2 ||
+				typeof pair[0] !== "string" ||
+				!pair[0] ||
+				typeof pair[1] !== "string" ||
+				!pair[1]
+			)
+				return
+			parent = pair[0]
+			parentId = pair[1]
+		} catch {
+			return
+		}
+	}
+	if (childId(parent, index, total, parentId) !== value) return
+	return { parent, parentId, index, total }
 }
 
 export const parallelToolDefinition = (tools: Record<string, unknown>[]) => {
@@ -165,7 +193,12 @@ const expandCall = (item: Record<string, unknown>, names: Set<string>) => {
 	return calls.map((call, index) => ({
 		type: "function_call",
 		id: childId(item.id as string, index, calls.length),
-		call_id: childId(item.call_id as string, index, calls.length),
+		call_id: childId(
+			item.call_id as string,
+			index,
+			calls.length,
+			item.id as string,
+		),
 		name: call.name,
 		arguments: call.arguments,
 		status: item.status ?? "completed",
@@ -182,17 +215,31 @@ const parseClientArguments = (
 	} catch {}
 }
 
-// Images (and unknown content types) must remain real tool output content, not
-// strings embedded in the batch JSON, so replay their entire group unbatched.
-const canFoldOutput = (value: unknown): boolean =>
-	typeof value === "string" ||
-	(Array.isArray(value) &&
-		value.every(
-			(part) =>
+// Lite's tool-output branch requires a string, unlike the public Responses
+// content-array union. Do not send image data as text or leak synthetic children
+// upstream just because one tool returned an image. Keep its neighboring text.
+const liteToolOutput = (value: unknown): string => {
+	if (typeof value === "string") return value
+	if (!Array.isArray(value)) return JSON.stringify(value) ?? ""
+	return value
+		.map((part) => {
+			if (
 				isRecord(part) &&
 				part.type === "input_text" &&
-				typeof part.text === "string",
-		))
+				typeof part.text === "string"
+			)
+				return part.text
+			if (isRecord(part) && part.type === "input_image")
+				return "[Image omitted: Responses Lite tool outputs support text only.]"
+			if (isRecord(part) && part.type === "input_file")
+				return "[File omitted: Responses Lite tool outputs support text only.]"
+			return "[Unsupported tool output content omitted: Responses Lite tool outputs support text only.]"
+		})
+		.join("\n")
+}
+
+const isFunctionItemId = (value: unknown): value is string =>
+	typeof value === "string" && /^fc_[A-Za-z0-9_-]+$/.test(value)
 
 export const adaptParallelInput = (input: unknown[]): unknown[] => {
 	const groups = new Map<
@@ -202,6 +249,7 @@ export const adaptParallelInput = (input: unknown[]): unknown[] => {
 			valid: boolean
 			calls: Map<number, Record<string, unknown>>
 			outputs: Map<number, Record<string, unknown>>
+			parentIds: Set<string>
 		}
 	>()
 	for (const item of input) {
@@ -217,7 +265,9 @@ export const adaptParallelInput = (input: unknown[]): unknown[] => {
 			valid: true,
 			calls: new Map<number, Record<string, unknown>>(),
 			outputs: new Map<number, Record<string, unknown>>(),
+			parentIds: new Set<string>(),
 		}
+		if (child.parentId) group.parentIds.add(child.parentId)
 		const destination =
 			item.type === "function_call" ? group.calls : group.outputs
 		if (group.total !== child.total || destination.has(child.index))
@@ -231,6 +281,9 @@ export const adaptParallelInput = (input: unknown[]): unknown[] => {
 	>()
 	for (const [parent, group] of groups) {
 		if (
+			parent.length > 64 ||
+			!/^[A-Za-z0-9_-]+$/.test(parent) ||
+			parent.startsWith(childPrefix) ||
 			!group.valid ||
 			group.calls.size !== group.total ||
 			group.outputs.size !== group.total
@@ -238,7 +291,7 @@ export const adaptParallelInput = (input: unknown[]): unknown[] => {
 			continue
 		const calls = []
 		const results = []
-		const parentIds = new Set<string>()
+		const parentIds = new Set(group.parentIds)
 		for (let index = 0; index < group.total; index++) {
 			const call = group.calls.get(index)
 			const output = group.outputs.get(index)
@@ -248,30 +301,32 @@ export const adaptParallelInput = (input: unknown[]): unknown[] => {
 				!output ||
 				typeof call.name !== "string" ||
 				!call.name ||
-				!args ||
-				!canFoldOutput(output.output)
+				!args
 			)
 				break
 			calls.push({ name: call.name, arguments: args })
 			results.push({
 				name: call.name,
-				output: output.output,
+				output: liteToolOutput(output.output),
 				...(output.status === undefined ? {} : { status: output.status }),
 			})
 			const id = parseChildId(call.id)
-			if (id?.index === index && id.total === group.total)
+			if (
+				!group.parentIds.size &&
+				id?.index === index &&
+				id.total === group.total
+			)
 				parentIds.add(id.parent)
 		}
 		// Decide for the whole group before replacing anything in the history.
 		if (calls.length !== group.total) continue
-		// Item IDs are only a hint for preserving an upstream ID. SDKs may omit
-		// or rewrite them; call_id alone determines the group and fallback ID.
+		// call_id metadata is authoritative; legacy item IDs are only a hint.
 		const parentId =
 			parentIds.size === 1 ? parentIds.values().next().value : undefined
 		folded.set(parent, {
 			call: {
 				type: "function_call",
-				id: parentId ?? `fc_${encodeId(parent)}`,
+				id: isFunctionItemId(parentId) ? parentId : `fc_${encodeId(parent)}`,
 				call_id: parent,
 				name: PARALLEL_TOOL_FUNCTION,
 				status: "completed",
@@ -286,7 +341,7 @@ export const adaptParallelInput = (input: unknown[]): unknown[] => {
 	}
 	const insertedCalls = new Set<string>()
 	const insertedOutputs = new Set<string>()
-	return input.flatMap((item) => {
+	const reconstructed = input.flatMap((item) => {
 		if (
 			!isRecord(item) ||
 			(item.type !== "function_call" && item.type !== "function_call_output")
@@ -304,6 +359,53 @@ export const adaptParallelInput = (input: unknown[]): unknown[] => {
 		if (insertedOutputs.has(child.parent)) return []
 		insertedOutputs.add(child.parent)
 		return [group.output]
+	})
+	// Incomplete/ambiguous legacy groups cannot be folded without inventing
+	// results. Replay them with request-local, collision-free protocol IDs and
+	// string outputs instead of passing proxy IDs and content arrays to Lite.
+	const usedIds = new Set(
+		reconstructed.flatMap((item) =>
+			isRecord(item) ? [item.id, item.call_id] : [],
+		),
+	)
+	const replacements = new Map<string, string>()
+	let nextId = 0
+	const replacement = (id: string) => {
+		let mapped = replacements.get(id)
+		if (mapped) return mapped
+		do {
+			mapped = `call_openai_oauth_${nextId++}`
+		} while (usedIds.has(mapped) || usedIds.has(`fc_${mapped}`))
+		replacements.set(id, mapped)
+		return mapped
+	}
+	return reconstructed.map((item) => {
+		if (
+			!isRecord(item) ||
+			(item.type !== "function_call" && item.type !== "function_call_output")
+		)
+			return item
+		const synthetic =
+			typeof item.call_id === "string" && item.call_id.startsWith(childPrefix)
+		if (synthetic) {
+			const callId = replacement(item.call_id as string)
+			if (item.type === "function_call")
+				return {
+					...item,
+					id: `fc_${callId}`,
+					call_id: callId,
+					arguments:
+						typeof item.arguments === "string"
+							? item.arguments
+							: JSON.stringify(item.arguments ?? {}),
+				}
+			const { id: _id, ...output } = item
+			return { ...output, call_id: callId, output: liteToolOutput(item.output) }
+		}
+		return item.type === "function_call_output" &&
+			typeof item.output !== "string"
+			? { ...item, output: liteToolOutput(item.output) }
+			: item
 	})
 }
 

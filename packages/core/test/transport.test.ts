@@ -390,6 +390,7 @@ describe("createCodexOAuthFetch", () => {
 			shape: "missing item ID",
 			id: undefined,
 			output: "done",
+			normalizedOutput: "done",
 			args: "{}",
 			folds: true,
 		},
@@ -397,6 +398,7 @@ describe("createCodexOAuthFetch", () => {
 			shape: "rewritten item ID",
 			id: "fc_sdk",
 			output: "done",
+			normalizedOutput: "done",
 			args: "{}",
 			folds: true,
 		},
@@ -404,6 +406,7 @@ describe("createCodexOAuthFetch", () => {
 			shape: "text content array",
 			id: undefined,
 			output: [{ type: "input_text", text: "done" }],
+			normalizedOutput: "done",
 			args: "{}",
 			folds: true,
 		},
@@ -414,19 +417,23 @@ describe("createCodexOAuthFetch", () => {
 				{ type: "input_text", text: "Screenshot" },
 				{ type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
 			],
+			normalizedOutput:
+				"Screenshot\n[Image omitted: Responses Lite tool outputs support text only.]",
 			args: "{}",
-			folds: false,
+			folds: true,
 		},
 		{
 			shape: "non-string arguments",
 			id: "fc_sdk",
 			output: "done",
+			normalizedOutput: "done",
 			args: {},
 			folds: false,
 		},
 	])("forwards SDK parallel history with $shape without a bridge 400", async ({
 		id,
 		output,
+		normalizedOutput,
 		args,
 		folds,
 	}) => {
@@ -485,11 +492,26 @@ describe("createCodexOAuthFetch", () => {
 				{
 					type: "function_call_output",
 					call_id: "call_parent",
-					output: JSON.stringify({ results: [{ name: "view_image", output }] }),
+					output: JSON.stringify({
+						results: [{ name: "view_image", output: normalizedOutput }],
+					}),
 				},
 			])
 		} else {
-			expect(body.input.slice(1)).toEqual(JSON.parse(JSON.stringify(history)))
+			expect(body.input.slice(-2)).toEqual([
+				{
+					type: "function_call",
+					id: "fc_call_openai_oauth_0",
+					call_id: "call_openai_oauth_0",
+					name: "view_image",
+					arguments: "{}",
+				},
+				{
+					type: "function_call_output",
+					call_id: "call_openai_oauth_0",
+					output: "done",
+				},
+			])
 		}
 	})
 

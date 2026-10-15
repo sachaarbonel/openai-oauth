@@ -841,7 +841,7 @@ const prepareResponsesRequestBody = async (
 		}
 
 		const expanded = state?.expandRequestBody(normalized) ?? normalized
-		if (parallelToolNames?.size && Array.isArray(expanded.input))
+		if (modelInfo?.useResponsesLite && Array.isArray(expanded.input))
 			expanded.input = adaptParallelInput(expanded.input)
 
 		const patchToolName =

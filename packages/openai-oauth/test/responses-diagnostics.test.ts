@@ -8,6 +8,7 @@ import {
 	createResponsesDiagnostics,
 	summarizeRejection,
 } from "../src/responses-diagnostics.js"
+import { summarizeRequestInput } from "../src/responses-input-diagnostics.js"
 import {
 	observeResponsesFetch,
 	summarizeRequestTools,
@@ -15,6 +16,215 @@ import {
 } from "../src/responses-request-diagnostics.js"
 
 describe("bounded Responses diagnostics", () => {
+	test("locates Lite replay schema violations beyond the tool scan limit without content", () => {
+		const summary = summarizeRequestInput(
+			{
+				input: [
+					...Array.from({ length: 150 }, () => ({
+						role: "user",
+						content: "PRIVATE_PROMPT",
+					})),
+					{
+						type: "function_call",
+						id: "__openai_oauth_batch_PRIVATE",
+						call_id: "__openai_oauth_batch_PRIVATE",
+						name: "PRIVATE_TOOL",
+						arguments: "PRIVATE_ARGS",
+					},
+					{
+						type: "function_call_output",
+						call_id: "call_fixture",
+						output: [{ type: "input_image", image_url: "PRIVATE_IMAGE" }],
+					},
+					{ type: "PRIVATE_TYPE", output: "PRIVATE_OUTPUT" },
+				],
+			},
+			true,
+		)
+		expect(summary).toEqual({
+			shape: "array",
+			count: 153,
+			types: {
+				message: 150,
+				function_call: 1,
+				function_call_output: 1,
+				unknown: 1,
+			},
+			issues: [
+				{
+					index: 150,
+					type: "function_call",
+					field: "call_id",
+					reason: "synthetic_bridge_id",
+					shape: "string",
+				},
+				{
+					index: 150,
+					type: "function_call",
+					field: "id",
+					reason: "expected_function_item_id",
+					shape: "string",
+				},
+				{
+					index: 151,
+					type: "function_call_output",
+					field: "output",
+					reason: "lite_requires_string",
+					shape: "array",
+				},
+			],
+			issuesTruncated: false,
+		})
+		expect(JSON.stringify(summary)).not.toContain("PRIVATE")
+		const bounded = summarizeRequestInput(
+			{
+				input: Array.from({ length: 100 }, () => ({
+					type: "function_call_output",
+					output: [],
+				})),
+			},
+			true,
+		)
+		expect(bounded.issues).toHaveLength(16)
+		expect(bounded.issuesTruncated).toBe(true)
+		expect(
+			summarizeRequestInput(
+				{
+					input: [
+						{
+							type: "function_call_output",
+							call_id: "call_fixture",
+							output: [],
+						},
+					],
+				},
+				false,
+			).issues,
+		).toEqual([])
+	})
+
+	test("captures large image histories and identifies the upstream input location with its type", async () => {
+		const write = vi.fn()
+		const body = JSON.stringify({
+			input: [
+				{ role: "user", content: "PRIVATE_PROMPT" },
+				{
+					type: "function_call_output",
+					call_id: "call_fixture",
+					output: [
+						{
+							type: "input_image",
+							image_url: `data:image/png;base64,${"A".repeat(1_048_576)}`,
+						},
+					],
+				},
+			],
+		})
+		const error = {
+			error: {
+				type: "invalid_request_error",
+				param: "input[1].output",
+				message:
+					"Invalid input[1].output: expected a string. PRIVATE_ERROR Authorization: Bearer PRIVATE_TOKEN",
+			},
+		}
+		const transport = vi.fn(async () => Response.json(error, { status: 400 }))
+		await withResponsesRequestDiagnostics(true, async () => {
+			const response = await observeResponsesFetch(transport)(
+				"https://fixture.invalid/responses",
+				{
+					headers: { "x-openai-internal-codex-responses-lite": "true" },
+					body,
+				},
+			)
+			await createResponsesDiagnostics(true, write)()?.(
+				"upstream_response",
+				response,
+			)
+			expect(await response.json()).toEqual(error)
+		})
+		expect(transport).toHaveBeenCalledTimes(1)
+		const log = JSON.parse(write.mock.calls[0][0])
+		expect(log.upstreamRequest).toMatchObject({
+			capture: "captured",
+			responsesLite: true,
+			input: {
+				count: 2,
+				issues: [
+					{
+						index: 1,
+						type: "function_call_output",
+						field: "output",
+						reason: "lite_requires_string",
+						shape: "array",
+					},
+				],
+			},
+		})
+		expect(log.rejection).toMatchObject({
+			param: "input[1].output",
+			inputErrors: [
+				{ index: 1, type: "function_call_output", field: "output" },
+			],
+		})
+		expect(write.mock.calls[0][0]).not.toMatch(/PRIVATE|data:image|AAAA/)
+	})
+
+	test("extracts only safe upstream input indexes, types, and fields", () => {
+		expect(
+			summarizeRejection({
+				detail: [
+					{
+						type: "invalid_type",
+						loc: ["body", "input", 7, "function_call", "id"],
+						msg: "PRIVATE",
+					},
+				],
+			}),
+		).toMatchObject({
+			param: "input[7].function_call.id",
+			inputErrors: [{ index: 7, type: "function_call", field: "id" }],
+		})
+		const summary = summarizeRejection({
+			error: {
+				param: "input[3].PRIVATE_FIELD",
+				message: "Invalid input.4.output PRIVATE_SECRET",
+			},
+		})
+		expect(summary.inputErrors).toEqual([
+			{ index: 3, type: "unknown" },
+			{ index: 4, type: "unknown", field: "output" },
+		])
+		expect(JSON.stringify(summary)).not.toContain("PRIVATE")
+		expect(
+			summarizeRejection({
+				error: { message: "Invalid input. Authorization: input[9].output" },
+			}).inputErrors,
+		).toBeUndefined()
+	})
+
+	test("reports every validation location without retaining echoed input values", () => {
+		const summary = summarizeRejection({
+			detail: [
+				{
+					loc: ["body", "input", 3, "function_call", "id"],
+					msg: "PRIVATE_ID",
+					input: "PRIVATE_ID",
+				},
+				{
+					loc: ["body", "input", 6, "function_call_output", "output"],
+					msg: "PRIVATE_IMAGE",
+					input: ["PRIVATE_IMAGE"],
+				},
+			],
+		})
+		expect(summary.inputErrors).toEqual([
+			{ index: 3, type: "function_call", field: "id" },
+			{ index: 6, type: "function_call_output", field: "output" },
+		])
+		expect(JSON.stringify(summary)).not.toContain("PRIVATE")
+	})
+
 	test("returns the logged proxy ID without consuming or buffering the stream", async () => {
 		const write = vi.fn()
 		const cancel = vi.fn()

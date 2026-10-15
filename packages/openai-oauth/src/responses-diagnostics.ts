@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { rejectionInputLocations } from "./responses-input-diagnostics.js"
 import {
 	createResponsesLifecycleTrace,
 	type ResponsesLifecycleTrace,
@@ -6,6 +7,7 @@ import {
 import {
 	diagnosticToolTypes,
 	summarizeRequestTools,
+	upstreamInputType,
 	upstreamRequestSummary,
 } from "./responses-request-diagnostics.js"
 import { observeResponsesStream } from "./responses-stream-diagnostics.js"
@@ -47,6 +49,15 @@ const safeWords = new Set([
 	"service_unavailable_error",
 	"model",
 	"input",
+	"id",
+	"call_id",
+	"arguments",
+	"output",
+	"status",
+	"function_call",
+	"function_call_output",
+	"custom_tool_call",
+	"custom_tool_call_output",
 	"instructions",
 	"tools",
 	"tool_choice",
@@ -119,7 +130,7 @@ const serviceTiers = new Set([
 const messageWords = new Set([
 	...[...safeWords].map((word) => word.toLowerCase()),
 	...serviceTiers,
-	..."invalid unsupported supported allowed disallowed forbidden permitted denied unavailable available required requires expected valid value values argument parameter field tier tiers account project plan must should can cannot is are was were be not only one of and or for with this the a an to on in set provided received does do support supports accept accepts accepted rejected enabled disabled tool tools namespaces".split(
+	..."string array object prefix invalid unsupported supported allowed disallowed forbidden permitted denied unavailable available required requires expected valid value values argument parameter field tier tiers account project plan must should can cannot is are was were be not only one of and or for with this the a an to on in set provided received does do support supports accept accepts accepted rejected enabled disabled tool tools namespaces".split(
 		" ",
 	),
 ])
@@ -156,6 +167,20 @@ const summarizeServiceTier = (body: Record<string, unknown>) => {
 		? value
 		: "unrecognized_value_withheld"
 }
+
+const validationLocation = (value: unknown): string =>
+	Array.isArray(value)
+		? value
+				.filter((part) => part !== "body")
+				.map((part, index) =>
+					typeof part === "number" && Number.isSafeInteger(part) && part >= 0
+						? `[${part}]`
+						: typeof part === "string"
+							? `${index ? "." : ""}${part}`
+							: ".unknown",
+				)
+				.join("")
+		: ""
 
 // Error fields can echo secrets and prompts. Only known protocol identifiers and
 // fixed vocabulary leave this function; unrecognized prose is never logged.
@@ -217,19 +242,28 @@ export const summarizeRejection = (body: unknown) => {
 	const referencedFields = [...safeWords]
 		.filter((word) => new RegExp(`\\b${word}\\b`).test(message))
 		.slice(0, 16)
-	const loc = Array.isArray(error.loc)
-		? error.loc.filter((part) => part !== "body")
-		: []
-	const location = loc
-		.map((part, index) =>
-			typeof part === "number" ? `[${part}]` : `${index ? "." : ""}${part}`,
-		)
-		.join("")
+	const location = validationLocation(error.loc)
 	return {
 		shape,
 		type: safeField(error.type),
 		code: safeField(error.code),
 		param: safeField(error.param) ?? safeField(location),
+		inputErrors: rejectionInputLocations(
+			[
+				error.param,
+				location,
+				message,
+				...(errors ?? [])
+					.filter(isRecord)
+					.flatMap((entry) => [
+						entry.param,
+						validationLocation(entry.loc),
+						entry.message,
+						entry.msg,
+					]),
+			],
+			upstreamInputType,
+		),
 		reason,
 		messageSummary: summarizeMessage(message),
 		withheldBecause:
