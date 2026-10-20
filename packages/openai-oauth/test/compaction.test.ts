@@ -85,7 +85,14 @@ test("returns a native compaction window through the authenticated V2 Responses 
 		expect(response.headers.get("cache-control")).toBe("no-store")
 		expect(await response.json()).toMatchObject({
 			object: "response.compaction",
-			output: [opaque],
+			output: [
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: "Keep my correction" }],
+				},
+				opaque,
+			],
 			usage: { input_tokens: 55, output_tokens: 12 },
 		})
 		expect(calls).toHaveLength(1)
@@ -150,4 +157,48 @@ test("rejects ordinary text instead of pretending it is native compaction", asyn
 			},
 		],
 	)
+})
+
+test("repeated native compaction retains original user corrections in its complete working window", async () => {
+	await fixture(async (handler) => {
+		const first = await handler(
+			request({
+				model: "gpt-6-luna",
+				input: [
+					{ role: "user", content: "Correction: Indigo-91 replaces Amber." },
+					{ role: "assistant", content: "Noted" },
+				],
+			}),
+		)
+		const firstWindow = await first.json()
+		const second = await handler(
+			request({
+				model: "gpt-6-luna",
+				input: [
+					...firstWindow.output,
+					{ role: "user", content: "Continue unrelated background work." },
+					{ role: "assistant", content: "Long assistant history" },
+				],
+			}),
+		)
+		expect(second.status).toBe(200)
+		const secondWindow = await second.json()
+		expect(secondWindow.output).toEqual([
+			{
+				type: "message",
+				role: "user",
+				content: [
+					{ type: "input_text", text: "Correction: Indigo-91 replaces Amber." },
+				],
+			},
+			{
+				type: "message",
+				role: "user",
+				content: [
+					{ type: "input_text", text: "Continue unrelated background work." },
+				],
+			},
+			opaque,
+		])
+	})
 })
