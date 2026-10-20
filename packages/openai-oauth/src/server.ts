@@ -10,6 +10,7 @@ import {
 } from "@openai-oauth/core"
 import { openaiCredentials } from "@openai-oauth/local"
 import { handleChatCompletionsRequest } from "./chat-completions.js"
+import { handleCompactionRequest } from "./compaction.js"
 import {
 	handleImageEditRequest,
 	handleImageGenerationRequest,
@@ -72,6 +73,10 @@ const handleRoutes = async (
 				"upstream_error",
 			)
 		}
+	}
+
+	if (request.method === "POST" && url.pathname === "/v1/responses/compact") {
+		return handleCompactionRequest(request, client)
 	}
 
 	if (request.method === "POST" && url.pathname === "/v1/responses") {
