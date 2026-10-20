@@ -73,6 +73,7 @@ export const handleCompactionRequest = async (
 	if (
 		!isRecord(value) ||
 		!Array.isArray(value.output) ||
+		value.output.length !== 1 ||
 		value.output.filter(
 			(item) =>
 				isRecord(item) &&
@@ -92,11 +93,27 @@ export const handleCompactionRequest = async (
 			502,
 			"compaction_failed",
 		)
+	// V2 returns encrypted assistant/tool state only. Its client must retain user-authored
+	// messages; returning just the encrypted item loses their instructions and corrections.
+	const retained = input
+		.filter(
+			(item) =>
+				isRecord(item) &&
+				["user", "system", "developer"].includes(String(item.role)),
+		)
+		.map((item) => ({
+			...item,
+			type: "message",
+			content:
+				typeof item.content === "string"
+					? [{ type: "input_text", text: item.content }]
+					: item.content,
+		}))
 	const response = toJsonResponse({
 		id: value.id,
 		object: "response.compaction",
 		created_at: value.created_at,
-		output: value.output,
+		output: [...retained, ...value.output],
 		usage: value.usage,
 	})
 	response.headers.set("Cache-Control", "no-store")
