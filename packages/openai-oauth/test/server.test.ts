@@ -168,7 +168,7 @@ describe("openai oauth server", () => {
 		expect(
 			fetch.mock.calls.some(([input]) =>
 				String(input).includes(
-					"/backend-api/codex/models?client_version=0.144.1",
+					"/backend-api/codex/models?client_version=0.164.0",
 				),
 			),
 		).toBe(true)
