@@ -1,6 +1,6 @@
 import { isRecord } from "./utils.js"
 
-export const DEFAULT_CODEX_CLIENT_VERSION = "0.144.1"
+export const DEFAULT_CODEX_CLIENT_VERSION = "0.164.0"
 
 type FetchLike = typeof fetch
 

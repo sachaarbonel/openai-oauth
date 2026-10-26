@@ -11,7 +11,7 @@ describe("Codex model catalog", () => {
 		const fetchImpl = vi.fn(async () => Response.json({ version: "0.144.1" }))
 
 		await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe(
-			"0.144.1",
+			"0.164.0",
 		)
 		expect(fetchImpl).not.toHaveBeenCalled()
 	})
@@ -39,7 +39,7 @@ describe("Codex model catalog", () => {
 			onWarning: (message) => warnings.push(message),
 		})
 
-		expect(version).toBe("0.144.1")
+		expect(version).toBe("0.164.0")
 		expect(warnings).toEqual([])
 	})
 

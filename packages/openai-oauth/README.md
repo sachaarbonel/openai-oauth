@@ -61,7 +61,7 @@ Binding `--host` beyond loopback exposes the proxy to your network. Anyone who c
 
 Login listens on loopback and uses `http://localhost:1455/auth/callback`, the local callback URL accepted by OpenAI OAuth.
 
-The CLI pins the tested Codex protocol version (0.144.1); it never looks up npm latest in the request path. Advanced flags also exist for overriding it, the upstream Codex base URL, OAuth client id, and OAuth token URL.
+The CLI pins the tested Codex protocol version (0.164.0); it never looks up npm latest in the request path. Advanced flags also exist for overriding it, the upstream Codex base URL, OAuth client id, and OAuth token URL.
 
 ## More
 
