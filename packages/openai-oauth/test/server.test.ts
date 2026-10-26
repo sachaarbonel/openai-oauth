@@ -233,7 +233,8 @@ describe("openai oauth server", () => {
 		expect(response.status).toBe(502)
 		await expect(response.json()).resolves.toEqual({
 			error: {
-				message: "This account does not support codex model discovery.",
+				message:
+					"Model metadata is temporarily unavailable. Please retry shortly.",
 				type: "upstream_error",
 			},
 		})

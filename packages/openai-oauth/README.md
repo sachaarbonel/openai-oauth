@@ -61,8 +61,10 @@ Binding `--host` beyond loopback exposes the proxy to your network. Anyone who c
 
 Login listens on loopback and uses `http://localhost:1455/auth/callback`, the local callback URL accepted by OpenAI OAuth.
 
-The CLI resolves the latest published Codex client version automatically. Advanced flags also exist for overriding it, the upstream Codex base URL, OAuth client id, and OAuth token URL.
+The CLI pins the tested Codex protocol version (0.144.1); it never looks up npm latest in the request path. Advanced flags also exist for overriding it, the upstream Codex base URL, OAuth client id, and OAuth token URL.
 
 ## More
 
 [Learn more in the openai-oauth README.](https://github.com/EvanZhouDev/openai-oauth#readme)
+
+Model metadata is loaded before the CLI listens, even with a configured model list. Known models use an immutable last-good snapshot for up to 24 hours while stale metadata refreshes in the background. Refreshes are single-flight, time out after five seconds, and retry with exponential backoff (one to sixty seconds). A failed refresh preserves the last good protocol metadata. Cold or unknown-model requests require valid metadata and fail explicitly rather than guessing a wire format. Each transport isolates caches by upstream configuration and account/FedRAMP scope.

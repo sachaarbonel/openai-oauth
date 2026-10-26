@@ -988,3 +988,44 @@ describe("collectCompletedResponseFromSse", () => {
 		})
 	})
 })
+
+test("missing metadata fails closed without forwarding an unnormalized response", async () => {
+	const upstream = vi.fn(async () =>
+		Response.json({ error: { message: "Unavailable" } }, { status: 503 }),
+	)
+	const transport = createRuntimeOpenAIOAuthTransport({
+		auth: session,
+		fetch: upstream,
+	})
+	const response = await transport.request("/responses", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ model: "gpt-6-astra", input: "Hello" }),
+	})
+	expect(response.status).toBe(503)
+	expect(await response.json()).toMatchObject({
+		error: { code: "model_metadata_unavailable" },
+	})
+	expect(
+		upstream.mock.calls.every(([url]) => String(url).includes("/models?")),
+	).toBe(true)
+})
+
+test("an unknown model fails explicitly instead of guessing its request format", async () => {
+	const upstream = createMockFetch()
+	const transport = createRuntimeOpenAIOAuthTransport({
+		auth: session,
+		fetch: upstream,
+	})
+	await transport.request("/models")
+	const response = await transport.request("/responses", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ model: "not-in-this-account", input: "Hello" }),
+	})
+	expect(response.status).toBe(400)
+	expect(await response.json()).toMatchObject({
+		error: { code: "model_not_available" },
+	})
+	expect(upstreamCalls(upstream)).toHaveLength(0)
+})

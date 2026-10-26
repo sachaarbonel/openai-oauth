@@ -16,7 +16,7 @@ import {
 	handleImageGenerationRequest,
 } from "./images.js"
 import { createRequestLogger } from "./logging.js"
-import { createModelResolver } from "./models.js"
+import { createModelResolver, resolveOpenAIOAuthModels } from "./models.js"
 import { handleResponsesRequest } from "./responses.js"
 import { createResponsesDiagnostics } from "./responses-diagnostics.js"
 import {
@@ -137,7 +137,11 @@ const createOpenAIOAuthRuntime = (settings: OpenAIOAuthServerOptions = {}) => {
 		}
 	}
 
-	return { handler, resolveModels }
+	return {
+		handler,
+		resolveModels,
+		warmModels: () => resolveOpenAIOAuthModels(client, undefined),
+	}
 }
 
 export const createOpenAIOAuthFetchHandler = (
@@ -151,6 +155,7 @@ export const startOpenAIOAuthServer = async (
 	const host = settings.host ?? DEFAULT_HOST
 	const port = settings.port ?? DEFAULT_PORT
 	const runtime = createOpenAIOAuthRuntime(settings)
+	await runtime.warmModels()
 	const models = await runtime.resolveModels()
 	const handler = runtime.handler
 	const server = createServer(async (req, res) => {
@@ -228,6 +233,15 @@ export const startOpenAIOAuthServer = async (
 		})
 	})
 
+	// Refresh the actual transport cache, including when a display-only model list is configured.
+	const refresh = setInterval(
+		() => {
+			void runtime.warmModels().catch(() => {})
+		},
+		5 * 60 * 1000,
+	)
+	refresh.unref()
+	server.once("close", () => clearInterval(refresh))
 	const address = resolveAddress(server.address() as AddressInfo, host)
 	return {
 		server,

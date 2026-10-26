@@ -6,17 +6,14 @@ import {
 } from "../src/models.js"
 
 describe("Codex model catalog", () => {
-	test("uses the latest Codex package version from npm", async () => {
+	test("pins the tested Codex protocol version without network discovery", async () => {
 		resetCodexClientVersionCache()
 		const fetchImpl = vi.fn(async () => Response.json({ version: "0.144.1" }))
 
 		await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe(
 			"0.144.1",
 		)
-		expect(fetchImpl).toHaveBeenCalledWith(
-			"https://registry.npmjs.org/@openai/codex/latest",
-			expect.any(Object),
-		)
+		expect(fetchImpl).not.toHaveBeenCalled()
 	})
 
 	test("uses an explicit Codex version without a registry request", async () => {
@@ -43,9 +40,7 @@ describe("Codex model catalog", () => {
 		})
 
 		expect(version).toBe("0.144.1")
-		expect(warnings).toEqual([
-			"Could not determine the latest Codex version. Falling back to 0.144.1. Pass a version explicitly if you need to override it.",
-		])
+		expect(warnings).toEqual([])
 	})
 
 	test("parses model metadata using the resolved client version", async () => {

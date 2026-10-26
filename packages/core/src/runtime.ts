@@ -6,6 +6,10 @@ import {
 } from "./apply-patch-bridge.js"
 import { CODEX_IMAGE_MODEL, prepareCodexImageRequest } from "./images.js"
 import {
+	createModelCatalogCache,
+	ModelMetadataError,
+} from "./model-catalog-cache.js"
+import {
 	type CodexModelInfo,
 	fetchCodexModelCatalog,
 	isPublicCodexModel,
@@ -32,8 +36,6 @@ export const DEFAULT_OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 export const DEFAULT_OPENAI_OAUTH_ISSUER = "https://auth.openai.com"
 export const DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile email offline_access"
 const DEFAULT_CODEX_INSTRUCTIONS = ""
-const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000
-const MODEL_CATALOG_FAILURE_TTL_MS = 60 * 1000
 const RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 
 export type FetchFunction = typeof fetch
@@ -769,12 +771,13 @@ type ResolveModelInfo = (
 ) => Promise<CodexModelInfo | undefined>
 
 type ModelCatalogResult = {
-	models: CodexModelInfo[]
+	models: readonly CodexModelInfo[]
 	error?: Error
 }
 
 type ResolveModelCatalog = (
 	auth: OpenAIOAuthSession,
+	requiredModel?: string,
 ) => Promise<ModelCatalogResult>
 
 const prepareResponsesRequestBody = async (
@@ -866,6 +869,8 @@ const prepareResponsesRequestBody = async (
 				: undefined,
 		}
 	} catch (error) {
+		if (error instanceof ModelMetadataError)
+			return { body, errorResponse: metadataErrorResponse(error) }
 		if (error instanceof ParallelToolBridgeError)
 			return {
 				body,
@@ -881,7 +886,8 @@ const prepareResponsesRequestBody = async (
 					{ status: 400 },
 				),
 			}
-		return { body }
+		if (error instanceof SyntaxError) return { body }
+		throw error
 	}
 }
 
@@ -990,79 +996,55 @@ const applyAuthHeaders = (headers: Headers, auth: OpenAIOAuthSession): void => {
 	}
 }
 
+const metadataErrorResponse = (error: ModelMetadataError): Response =>
+	Response.json(
+		{
+			error: {
+				message: error.message,
+				type: error.status === 400 ? "invalid_request_error" : "upstream_error",
+				code: error.code,
+			},
+		},
+		{
+			status: error.status,
+			headers: error.status === 503 ? { "retry-after": "5" } : undefined,
+		},
+	)
+
 const createModelCatalogResolver = (
 	fetch: FetchFunction,
 	baseURL: string,
 	settings: CodexOAuthRuntimeSettings,
 ): ResolveModelCatalog => {
-	const cache = new Map<
-		string,
-		{ expiresAt: number; result: ModelCatalogResult }
-	>()
-	const inflight = new Map<string, Promise<ModelCatalogResult>>()
-
-	return async (auth) => {
-		const cacheKey = `${auth.accountId}:${auth.isFedRamp === true}`
-		const cached = cache.get(cacheKey)
-		if (cached && cached.expiresAt > Date.now()) {
-			return cached.result
-		}
-
-		let loading = inflight.get(cacheKey)
-		if (!loading) {
-			loading = (async (): Promise<ModelCatalogResult> => {
-				try {
-					const models = await fetchCodexModelCatalog(
-						{
-							request: async (path, init) => {
-								const headers = new Headers(settings.headers)
-								new Headers(init?.headers).forEach((value, key) => {
-									headers.set(key, value)
-								})
-								applyAuthHeaders(headers, auth)
-								return fetch(
-									new URL(path.replace(/^\//, ""), `${baseURL}/`).toString(),
-									{
-										...init,
-										method: init?.method ?? "GET",
-										headers,
-									},
-								)
+	const resolve = createModelCatalogCache<OpenAIOAuthSession>(
+		(auth) =>
+			`${auth.accountId}:${auth.isFedRamp ?? (deriveChatGptAccountIsFedRamp(auth.idToken) || deriveChatGptAccountIsFedRamp(auth.accessToken))}`,
+		(auth, signal) =>
+			fetchCodexModelCatalog(
+				{
+					request: async (path, init) => {
+						const headers = new Headers(settings.headers)
+						new Headers(init?.headers).forEach((value, key) => {
+							headers.set(key, value)
+						})
+						applyAuthHeaders(headers, auth)
+						return fetch(
+							new URL(path.replace(/^\//, ""), `${baseURL}/`).toString(),
+							{
+								...init,
+								method: init?.method ?? "GET",
+								headers,
+								signal,
 							},
-						},
-						{
-							codexVersion: settings.codexVersion,
-							fetchImpl: fetch,
-						},
-					)
-					const result = { models }
-					cache.set(cacheKey, {
-						expiresAt: Date.now() + MODEL_CATALOG_TTL_MS,
-						result,
-					})
-					return result
-				} catch (error) {
-					const result = {
-						models: [],
-						error:
-							error instanceof Error
-								? error
-								: new Error("Failed to load models from Codex."),
-					}
-					cache.set(cacheKey, {
-						expiresAt: Date.now() + MODEL_CATALOG_FAILURE_TTL_MS,
-						result,
-					})
-					return result
-				}
-			})().finally(() => {
-				inflight.delete(cacheKey)
-			})
-			inflight.set(cacheKey, loading)
-		}
-
-		return loading
-	}
+						)
+					},
+				},
+				{ codexVersion: settings.codexVersion },
+			),
+	)
+	return async (auth, requiredModel) => ({
+		models: await resolve(auth, requiredModel),
+	})
 }
 
 const resolveAuth = async (
@@ -1090,7 +1072,7 @@ const createCodexOAuthFetch = (
 		settings,
 	)
 	const resolveModelInfo: ResolveModelInfo = async (auth, model) =>
-		(await resolveModelCatalog(auth)).models.find(
+		(await resolveModelCatalog(auth, model)).models.find(
 			(entry) => entry.slug === model,
 		)
 
@@ -1104,7 +1086,14 @@ const createCodexOAuthFetch = (
 			target.pathname.endsWith("/models") &&
 			!target.searchParams.has("client_version")
 		) {
-			const catalog = await resolveModelCatalog(auth)
+			let catalog: ModelCatalogResult
+			try {
+				catalog = await resolveModelCatalog(auth)
+			} catch (error) {
+				if (error instanceof ModelMetadataError)
+					return metadataErrorResponse(error)
+				throw error
+			}
 			const models = catalog.models.filter(isPublicCodexModel)
 			if (models.length === 0) {
 				return Response.json(
