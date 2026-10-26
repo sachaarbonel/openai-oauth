@@ -800,15 +800,14 @@ const prepareResponsesRequestBody = async (
 	if (typeof bodyText !== "string") {
 		return { body }
 	}
+	let parsed: unknown
 	try {
-		const parsed = JSON.parse(bodyText)
-		if (
-			typeof parsed !== "object" ||
-			parsed === null ||
-			Array.isArray(parsed)
-		) {
-			return { body }
-		}
+		parsed = JSON.parse(bodyText)
+	} catch {
+		return { body }
+	}
+	if (!isRecord(parsed)) return { body }
+	try {
 		const wantsStream = parsed.stream === true
 		const modelInfo =
 			typeof parsed.model === "string"
@@ -886,7 +885,6 @@ const prepareResponsesRequestBody = async (
 					{ status: 400 },
 				),
 			}
-		if (error instanceof SyntaxError) return { body }
 		throw error
 	}
 }
