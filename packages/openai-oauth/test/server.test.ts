@@ -168,7 +168,7 @@ describe("openai oauth server", () => {
 		expect(
 			fetch.mock.calls.some(([input]) =>
 				String(input).includes(
-					"/backend-api/codex/models?client_version=0.144.1",
+					"/backend-api/codex/models?client_version=0.164.0",
 				),
 			),
 		).toBe(true)
@@ -233,7 +233,8 @@ describe("openai oauth server", () => {
 		expect(response.status).toBe(502)
 		await expect(response.json()).resolves.toEqual({
 			error: {
-				message: "This account does not support codex model discovery.",
+				message:
+					"Model metadata is temporarily unavailable. Please retry shortly.",
 				type: "upstream_error",
 			},
 		})

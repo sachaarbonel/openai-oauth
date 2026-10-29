@@ -1,9 +1,6 @@
 import { isRecord } from "./utils.js"
 
-export const DEFAULT_CODEX_CLIENT_VERSION = "0.144.1"
-
-const CODEX_VERSION_CACHE_TTL_MS = 60 * 60 * 1000
-const CODEX_REGISTRY_URL = "https://registry.npmjs.org/@openai/codex/latest"
+export const DEFAULT_CODEX_CLIENT_VERSION = "0.164.0"
 
 type FetchLike = typeof fetch
 
@@ -33,10 +30,6 @@ export type FetchCodexModelCatalogOptions = ResolveCodexClientVersionOptions
 
 export type CodexModelCatalogClient = {
 	request(path: string, init?: RequestInit): Promise<Response>
-}
-
-type RegistryPackageResponse = {
-	version?: unknown
 }
 
 const normalizeVersion = (value: unknown): string | undefined => {
@@ -107,63 +100,14 @@ const toUpstreamErrorMessage = (bodyText: string): string => {
 	return bodyText
 }
 
-let cachedCodexClientVersion: string | undefined
-let codexClientVersionCacheExpiresAt = 0
-let inflightCodexClientVersion: Promise<string> | undefined
-
+/** Override explicitly only after testing the corresponding Codex wire protocol. */
 export const resolveCodexClientVersion = async (
 	options: ResolveCodexClientVersionOptions = {},
-): Promise<string> => {
-	const explicitVersion = normalizeVersion(options.codexVersion)
-	if (explicitVersion) {
-		return explicitVersion
-	}
+): Promise<string> =>
+	normalizeVersion(options.codexVersion) ?? DEFAULT_CODEX_CLIENT_VERSION
 
-	const now = Date.now()
-	if (cachedCodexClientVersion && now < codexClientVersionCacheExpiresAt) {
-		return cachedCodexClientVersion
-	}
-
-	if (inflightCodexClientVersion) {
-		return inflightCodexClientVersion
-	}
-
-	const fetchImpl = options.fetchImpl ?? globalThis.fetch
-	inflightCodexClientVersion = (async () => {
-		try {
-			const response = await fetchImpl(CODEX_REGISTRY_URL, {
-				headers: { accept: "application/json" },
-			})
-			if (response.ok) {
-				const parsed = (await response.json()) as RegistryPackageResponse
-				const version = normalizeVersion(parsed.version)
-				if (version) {
-					cachedCodexClientVersion = version
-					codexClientVersionCacheExpiresAt =
-						Date.now() + CODEX_VERSION_CACHE_TTL_MS
-					return version
-				}
-			}
-		} catch {}
-
-		options.onWarning?.(
-			`Could not determine the latest Codex version. Falling back to ${DEFAULT_CODEX_CLIENT_VERSION}. Pass a version explicitly if you need to override it.`,
-		)
-		cachedCodexClientVersion = DEFAULT_CODEX_CLIENT_VERSION
-		codexClientVersionCacheExpiresAt = Date.now() + CODEX_VERSION_CACHE_TTL_MS
-		return DEFAULT_CODEX_CLIENT_VERSION
-	})().finally(() => {
-		inflightCodexClientVersion = undefined
-	})
-
-	return inflightCodexClientVersion
-}
-
-export const resetCodexClientVersionCache = (): void => {
-	cachedCodexClientVersion = undefined
-	codexClientVersionCacheExpiresAt = 0
-	inflightCodexClientVersion = undefined
-}
+/** Retained for consumers which reset the former discovery cache. */
+export const resetCodexClientVersionCache = (): void => {}
 
 export const fetchCodexModelCatalog = async (
 	client: CodexModelCatalogClient,
