@@ -38,6 +38,8 @@ Supported endpoints:
 
 Native compaction accepts `model`, complete conversation `input`, and optional `instructions`. It uses the authenticated Codex V2 Responses transport with a `compaction_trigger`, requires a completed response containing one encrypted compaction item, and returns retained user/system/developer messages plus the encrypted state as the complete output window with usage under `object: "response.compaction"`. Replay that output window in the next Responses request and retain the original transcript separately. Server-side response references, caller-supplied triggers and tools are rejected; provider failures are returned without automatic retries or text-summary substitution.
 
+Clients behind an HTTP proxy can explicitly negotiate the gateway’s streamed compaction extension with `Accept: text/event-stream`. The gateway sends an initial SSE comment and a comment every 15 seconds while the same native compaction request is pending. A terminal `response.completed` event contains the canonical `response.compaction` JSON; an `error` event contains the original HTTP `status` and `error`. Cancellation aborts that provider call and removes the heartbeat. This is a gateway transport extension, not progressive summary text or a second model call. Without that header, the endpoint continues returning ordinary JSON. Retain the full saved transcript in either mode.
+
 Image generation uses JSON requests. Image editing uses the standard OpenAI multipart request with one or more `image` fields. Both return base64 image data and usage metadata.
 
 ```bash
