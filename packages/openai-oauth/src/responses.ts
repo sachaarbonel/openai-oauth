@@ -1,6 +1,7 @@
 import type { OpenAIOAuthTransport } from "@openai-oauth/core"
 import type { ResponseDiagnostic } from "./responses-diagnostics.js"
-import { copyUpstreamResponse, isRecord, toErrorResponse } from "./shared.js"
+import { withResponsesHeartbeat } from "./responses-heartbeat.js"
+import { isRecord, toErrorResponse } from "./shared.js"
 
 const usesServerReplayState = (body: Record<string, unknown>): boolean =>
 	typeof body.previous_response_id === "string" ||
@@ -55,5 +56,9 @@ export const handleResponsesRequest = async (
 		await record("transport_or_auth", new Response(null, { status: 500 }), body)
 		throw error
 	}
-	return record("upstream_response", copyUpstreamResponse(upstream), body)
+	return record(
+		"upstream_response",
+		withResponsesHeartbeat(upstream, request.signal),
+		body,
+	)
 }

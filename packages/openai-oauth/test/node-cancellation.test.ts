@@ -219,7 +219,7 @@ describe("Node HTTP cancellation", () => {
 		})
 	})
 
-	test("normal request and response completion preserves bytes without aborting", async () => {
+	test("normal request and response completion preserves SSE payload bytes without aborting", async () => {
 		vi.stubEnv("CODEX_OPENAI_RESPONSES_DIAGNOSTICS", "1")
 		const logs = vi.spyOn(console, "log").mockImplementation(() => {})
 		const bytes = Buffer.from(
@@ -255,7 +255,9 @@ describe("Node HTTP cancellation", () => {
 		)
 		await bounded(closed.promise)
 		expect(response.statusCode).toBe(200)
-		expect(Buffer.concat(chunks)).toEqual(bytes)
+		expect(Buffer.concat(chunks)).toEqual(
+			Buffer.concat([Buffer.from(": keep-alive\n"), bytes]),
+		)
 		expect(signal.aborted).toBe(false)
 		expect(cancel).not.toHaveBeenCalled()
 		const headerLog = logs.mock.calls
@@ -300,26 +302,34 @@ describe("Node HTTP cancellation", () => {
 	test("records upstream EOF before forwarding fails without a terminal SSE", async () => {
 		vi.stubEnv("CODEX_OPENAI_RESPONSES_DIAGNOSTICS", "1")
 		const logs = vi.spyOn(console, "log").mockImplementation(() => {})
+		const eof = deferred<void>()
+		cleanups.push(() => eof.resolve())
 		const { received, closed } = await connect(
 			() =>
 				new Response(
 					new ReadableStream<Uint8Array>({
 						start(controller) {
 							controller.enqueue(
-								Buffer.from(
-									"event: response.output_item.done\\ndata: {}\\n\\n",
-								),
+								Buffer.from("event: response.output_item.done\ndata: {}\n\n"),
 							)
-							controller.close()
+							void eof.promise.then(() => controller.close())
 						},
 					}),
 					{ headers: { "content-type": "text/event-stream" } },
 				),
 		)
 		const response = await bounded(received.promise)
+		eof.resolve()
+		// Liveness has already sent HTTP headers. A truncated upstream stream must
+		// fail that stream, rather than be rewritten as a successful JSON response.
 		await bounded(
-			new Promise<void>((resolve) => response.resume().once("end", resolve)),
+			new Promise<void>((resolve) => {
+				response.once("close", resolve)
+				response.on("error", () => {})
+				response.resume()
+			}),
 		)
+		expect(response.aborted).toBe(true)
 		await bounded(closed.promise)
 		const entries = logs.mock.calls.map(([line]) => JSON.parse(String(line)))
 		const lifecycle = entries

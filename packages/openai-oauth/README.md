@@ -40,6 +40,8 @@ Native compaction accepts `model`, complete conversation `input`, and optional `
 
 Clients behind an HTTP proxy can explicitly negotiate the gateway’s streamed compaction extension with `Accept: text/event-stream`. The gateway sends an initial SSE comment and a comment every 15 seconds while the same native compaction request is pending. A terminal `response.completed` event contains the canonical `response.compaction` JSON; an `error` event contains the original HTTP `status` and `error`. Cancellation aborts that provider call and removes the heartbeat. This is a gateway transport extension, not progressive summary text or a second model call. Without that header, the endpoint continues returning ordinary JSON. Retain the full saved transcript in either mode.
 
+Successful Responses SSE streams also send an initial keep-alive comment and bounded comments every 15 seconds, including while the model is reasoning silently. Comments are inserted only between complete SSE lines; model events, ordering and payloads remain unchanged. Pending lines are bounded at 8 MiB. Cancellation and upstream failures stop the heartbeat and release the upstream reader without retrying. JSON responses and HTTP errors keep their original status and body.
+
 Image generation uses JSON requests. Image editing uses the standard OpenAI multipart request with one or more `image` fields. Both return base64 image data and usage metadata.
 
 ```bash
