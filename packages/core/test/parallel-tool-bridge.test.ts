@@ -123,6 +123,87 @@ describe("Responses Lite parallel tool bridge", () => {
 		).toEqual(["read_palette", "read_layout"])
 	})
 
+	test.each([
+		17, 128,
+	])("keeps all %i catalog entries while bounding each batch", async (count) => {
+		const tools = Array.from({ length: count }, (_, index) => ({
+			type: "function",
+			name: `tool_${index}`,
+			parameters: { type: "object" },
+		}))
+		const definition = parallelToolDefinition(tools)
+		expect(
+			definition.parameters.properties.calls.items.properties.name.enum,
+		).toEqual(tools.map((tool) => tool.name))
+		expect(definition.parameters.properties.calls.maxItems).toBe(16)
+		const lastTool = `tool_${count - 1}`
+		const item = {
+			...batch,
+			arguments: JSON.stringify({ calls: [{ name: lastTool, arguments: {} }] }),
+		}
+		const frames = await read(
+			adaptParallelResponsesSse(
+				normalizeResponsesSse(
+					upstream(
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: { ...item, status: "in_progress", arguments: "" },
+						},
+						{ type: "response.output_item.done", output_index: 0, item },
+					),
+				),
+				new Set(tools.map((tool) => tool.name)),
+			),
+		)
+		expect(
+			frames.find((frame) => frame.type === "response.output_item.done")?.item,
+		).toMatchObject({ name: lastTool, arguments: "{}" })
+	})
+
+	test("retains independent catalog count and description limits", () => {
+		expect(() => parallelToolDefinition([])).toThrow(
+			"between 1 and 128 definitions",
+		)
+		expect(() =>
+			parallelToolDefinition(
+				Array.from({ length: 129 }, (_, index) => ({ name: `tool_${index}` })),
+			),
+		).toThrow("between 1 and 128 definitions")
+		expect(() =>
+			parallelToolDefinition([
+				{ name: "large", description: "x".repeat(64 * 1024) },
+			]),
+		).toThrow("description limit")
+	})
+
+	test("still rejects seventeen calls in one batch", async () => {
+		const names = Array.from({ length: 17 }, (_, index) => `tool_${index}`)
+		const item = {
+			...batch,
+			arguments: JSON.stringify({
+				calls: names.map((name) => ({ name, arguments: {} })),
+			}),
+		}
+		await expect(
+			read(
+				adaptParallelResponsesSse(
+					normalizeResponsesSse(
+						upstream(
+							{
+								type: "response.output_item.added",
+								output_index: 0,
+								item: { ...item, status: "in_progress", arguments: "" },
+							},
+							{ type: "response.output_item.done", output_index: 0, item },
+						),
+					),
+					new Set(names),
+				),
+			),
+		).rejects.toThrow("Invalid parallel tool call count")
+	})
+
 	test("expands batch calls in SSE, shifts following indexes, and recombines results", async () => {
 		const frames = await read(
 			adaptParallelResponsesSse(

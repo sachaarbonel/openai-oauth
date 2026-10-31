@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { expect, test } from "vitest"
+import { expect, test, vi } from "vitest"
 import { createOpenAIOAuthFetchHandler } from "../src/index.js"
 
 const opaque = {
@@ -16,6 +16,7 @@ async function fixture(
 	) => Promise<void>,
 	status = 200,
 	output: unknown[] = [opaque],
+	beforeResponse?: (init?: RequestInit) => Promise<void>,
 ) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "oauth-compact-"))
 	const authFilePath = path.join(root, "auth.json")
@@ -37,6 +38,7 @@ async function fixture(
 					models: [{ slug: "gpt-6-luna", use_responses_lite: true }],
 				})
 			calls.push({ url, init })
+			await beforeResponse?.(init)
 			if (status !== 200)
 				return Response.json({ error: { code: "unavailable" } }, { status })
 			return new Response(
@@ -201,4 +203,127 @@ test("repeated native compaction retains original user corrections in its comple
 			opaque,
 		])
 	})
+})
+
+test("negotiated compaction streams liveness before a delayed result without another provider call", async () => {
+	vi.useFakeTimers()
+	let finish = () => {}
+	let begin = () => {}
+	const started = new Promise<void>((resolve) => {
+		begin = resolve
+	})
+	const pending = new Promise<void>((resolve) => {
+		finish = resolve
+	})
+	try {
+		await fixture(
+			async (handler, calls) => {
+				const req = request({
+					model: "gpt-6-luna",
+					input: "Preserve this correction",
+				})
+				req.headers.set("accept", "text/event-stream")
+				const response = await handler(req)
+				expect(response.headers.get("content-type")).toContain(
+					"text/event-stream",
+				)
+				const reader = response.body?.getReader()
+				expect(reader).toBeDefined()
+				expect(new TextDecoder().decode((await reader?.read())?.value)).toBe(
+					": compacting\n\n",
+				)
+				await started
+				await vi.advanceTimersByTimeAsync(15_000)
+				expect(new TextDecoder().decode((await reader?.read())?.value)).toBe(
+					": compacting\n\n",
+				)
+				expect(calls).toHaveLength(1)
+				finish()
+				const terminal = new TextDecoder().decode((await reader?.read())?.value)
+				expect(JSON.parse(terminal.replace(/^data: /, ""))).toMatchObject({
+					type: "response.completed",
+					response: {
+						object: "response.compaction",
+						output: [
+							{
+								role: "user",
+								content: [
+									{ type: "input_text", text: "Preserve this correction" },
+								],
+							},
+							opaque,
+						],
+					},
+				})
+				expect((await reader?.read())?.done).toBe(true)
+				expect(vi.getTimerCount()).toBe(0)
+			},
+			200,
+			[opaque],
+			async () => {
+				begin()
+				await pending
+			},
+		)
+	} finally {
+		vi.useRealTimers()
+	}
+})
+
+test("negotiated compaction preserves a provider error as a terminal event", async () => {
+	await fixture(async (handler, calls) => {
+		const req = request({ model: "gpt-6-luna", input: "x" })
+		req.headers.set("accept", "text/event-stream")
+		const response = await handler(req)
+		const data = (await response.text())
+			.split("\n")
+			.find((line) => line.startsWith("data: "))
+		expect(JSON.parse(data?.slice(6) ?? "null")).toEqual({
+			type: "error",
+			status: 429,
+			error: { code: "unavailable" },
+		})
+		expect(calls).toHaveLength(1)
+	}, 429)
+})
+
+test("cancelling negotiated compaction aborts the one provider call and removes liveness timers", async () => {
+	vi.useFakeTimers()
+	let aborted = false
+	let begin = () => {}
+	const started = new Promise<void>((resolve) => {
+		begin = resolve
+	})
+	try {
+		await fixture(
+			async (handler, calls) => {
+				const req = request({ model: "gpt-6-luna", input: "x" })
+				req.headers.set("accept", "text/event-stream")
+				const response = await handler(req)
+				const reader = response.body?.getReader()
+				await reader?.read()
+				await started
+				await reader?.cancel("User stopped")
+				expect(aborted).toBe(true)
+				expect(calls).toHaveLength(1)
+				expect(vi.getTimerCount()).toBe(0)
+			},
+			200,
+			[opaque],
+			async (init) =>
+				new Promise((_resolve, reject) => {
+					begin()
+					init?.signal?.addEventListener(
+						"abort",
+						() => {
+							aborted = true
+							reject(new DOMException("Aborted", "AbortError"))
+						},
+						{ once: true },
+					)
+				}),
+		)
+	} finally {
+		vi.useRealTimers()
+	}
 })
