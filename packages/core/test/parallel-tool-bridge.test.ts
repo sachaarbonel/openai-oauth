@@ -136,7 +136,7 @@ describe("Responses Lite parallel tool bridge", () => {
 			definition.parameters.properties.calls.items.properties.name.enum,
 		).toEqual(tools.map((tool) => tool.name))
 		expect(definition.parameters.properties.calls.maxItems).toBe(16)
-		const lastTool = tools[count - 1]!.name
+		const lastTool = `tool_${count - 1}`
 		const item = {
 			...batch,
 			arguments: JSON.stringify({ calls: [{ name: lastTool, arguments: {} }] }),
