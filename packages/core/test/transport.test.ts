@@ -365,6 +365,48 @@ describe("createCodexOAuthFetch", () => {
 		])
 	})
 
+	test.each([
+		true,
+		false,
+	])("forwards large Lite tool catalogs without dropping tools (stream=%s)", async (stream) => {
+		const fetch = createMockFetch(
+			async () =>
+				new Response(
+					'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_catalog","status":"completed","output":[]}}\n\n',
+					{ headers: { "Content-Type": "text/event-stream" } },
+				),
+		)
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+		const tools = Array.from({ length: 32 }, (_, index) => ({
+			type: "function",
+			name: `read_${index}`,
+			parameters: { type: "object" },
+		}))
+		const response = await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				model: "gpt-6.1-sol",
+				input: "Read settings.",
+				stream,
+				parallel_tool_calls: true,
+				tools,
+			}),
+		})
+		expect(response.status).toBe(200)
+		await response.text()
+		expect(upstreamCalls(fetch)).toHaveLength(1)
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		const body = JSON.parse(String(init?.body))
+		expect(body.parallel_tool_calls).toBe(false)
+		const batchTool = body.input[0].tools[0]
+		expect(body.input[0].tools).toHaveLength(1)
+		expect(
+			batchTool.parameters.properties.calls.items.properties.name.enum,
+		).toEqual(tools.map((tool) => tool.name))
+		expect(batchTool.parameters.properties.calls.maxItems).toBe(16)
+	})
+
 	test("preserves native parallel calls for non-Lite models", async () => {
 		const fetch = createMockFetch()
 		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })

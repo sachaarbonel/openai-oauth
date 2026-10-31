@@ -1,6 +1,8 @@
 import { isRecord } from "./utils.js"
 
 export const PARALLEL_TOOL_FUNCTION = "__openai_oauth_parallel"
+// Catalog size and simultaneous calls are separate resource limits.
+const MAX_TOOL_DEFINITIONS = 128
 const MAX_BATCH_CALLS = 16
 const MAX_BATCH_DESCRIPTION = 64 * 1024
 const MAX_PENDING_EVENT_CHARACTERS = 32 * 1024 * 1024
@@ -84,9 +86,9 @@ const parseChildId = (value: unknown) => {
 }
 
 export const parallelToolDefinition = (tools: Record<string, unknown>[]) => {
-	if (tools.length === 0 || tools.length > MAX_BATCH_CALLS)
+	if (tools.length === 0 || tools.length > MAX_TOOL_DEFINITIONS)
 		throw new ParallelToolBridgeError(
-			"Parallel tool count must be between 1 and 16.",
+			"Parallel tool catalog must contain between 1 and 128 definitions.",
 		)
 	const names = tools.map((tool) => tool.name)
 	if (
