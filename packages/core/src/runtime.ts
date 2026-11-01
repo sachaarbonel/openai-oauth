@@ -1154,6 +1154,17 @@ const createCodexOAuthFetch = (
 			return preparedBody.errorResponse
 		}
 
+		// Codex routes its cache using session-id, not the public API body key alone.
+		// Use the caller's stable cache identity when it did not supply a session.
+		const cacheKey = preparedBody.requestBody?.prompt_cache_key
+		if (
+			!headers.has("session-id") &&
+			typeof cacheKey === "string" &&
+			/^[\x21-\x7e]{1,512}$/.test(cacheKey)
+		) {
+			headers.set("session-id", cacheKey)
+		}
+
 		const bridge =
 			settings.standaloneSearch === true &&
 			preparedBody.useResponsesLite === true &&
