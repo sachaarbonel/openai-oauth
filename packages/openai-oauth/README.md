@@ -72,3 +72,12 @@ The CLI pins the tested Codex protocol version (0.164.0); it never looks up npm 
 [Learn more in the openai-oauth README.](https://github.com/EvanZhouDev/openai-oauth#readme)
 
 Model metadata is loaded before the CLI listens, even with a configured model list. Known models use an immutable last-good snapshot for up to 24 hours while stale metadata refreshes in the background. Refreshes are single-flight, time out after five seconds, and retry with exponential backoff (one to sixty seconds). A failed refresh preserves the last good protocol metadata. Cold or unknown-model requests require valid metadata and fail explicitly rather than guessing a wire format. Each transport isolates caches by upstream configuration and account/FedRAMP scope.
+
+
+Responses requests retain the supported `session-id` and `thread-id` routing
+headers. For API clients which send only `prompt_cache_key`, the Codex transport
+also uses that stable key as `session-id` unless an explicit session was supplied.
+Use an opaque, stable key scoped to the user/workspace and model connection;
+never generate a new key on each request. Caller authorization, cookies and
+turn-state headers are not forwarded by the HTTP proxy. Cache hits are reported
+from upstream usage only; a stable prefix does not guarantee a hit.

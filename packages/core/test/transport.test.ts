@@ -142,6 +142,31 @@ describe("normalizeCodexResponsesBody", () => {
 })
 
 describe("createCodexOAuthFetch", () => {
+	test("uses a stable prompt cache key for Codex session routing without overriding explicit identity", async () => {
+		const fetch = createMockFetch()
+		const connection = createOpenAIOAuthTransport({ auth: session, fetch })
+		for (const headers of [{}, { "session-id": "explicit-session" }]) {
+			await connection.request("/responses", {
+				method: "POST",
+				headers: { "Content-Type": "application/json", ...headers },
+				body: JSON.stringify({
+					model: "gpt-6.1-sol",
+					prompt_cache_key: "stable-chat",
+				}),
+			})
+		}
+		const calls = upstreamCalls(fetch)
+		expect(new Headers(calls[0]?.[1]?.headers).get("session-id")).toBe(
+			"stable-chat",
+		)
+		expect(new Headers(calls[1]?.[1]?.headers).get("session-id")).toBe(
+			"explicit-session",
+		)
+		expect(JSON.parse(String(calls[0]?.[1]?.body)).prompt_cache_key).toBe(
+			"stable-chat",
+		)
+	})
+
 	test("returns an OpenAI-compatible list of visible models", async () => {
 		const fetch = createMockFetch()
 		const connection = createOpenAIOAuthTransport({ auth: session, fetch })

@@ -42,13 +42,18 @@ export const handleResponsesRequest = async (
 		)
 	}
 
+	const headers = new Headers({ "Content-Type": "application/json" })
+	// Forward only the supported routing identities. Never relay caller auth.
+	for (const name of ["session-id", "thread-id"]) {
+		const value = request.headers.get(name)
+		if (value) headers.set(name, value)
+	}
+
 	let upstream: Response
 	try {
 		upstream = await client.request("/responses", {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
+			headers,
 			body: JSON.stringify(body),
 			signal: request.signal,
 		})
